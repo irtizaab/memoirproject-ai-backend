@@ -40,6 +40,62 @@ class Settings(BaseSettings):
     # token for curl testing before the frontend login screen exists.
     supabase_anon_key: str | None = None
 
+    # --- Supabase Storage ---------------------------------------------------
+    # The service role key. This one IS a secret, and it is the only one this
+    # app holds.
+    #
+    # Everything above is public: the project URL and the anon key ship in
+    # every frontend bundle, and token verification uses Supabase's *public*
+    # JWKS. This key is different — it bypasses Row Level Security and can read
+    # or write anything in the project.
+    #
+    # It is here because contributors have no account. Signing an upload URL
+    # for someone with no token of their own cannot be done with a user's
+    # credentials, because they have none. Never log it, never return it in a
+    # response, never send it to the browser.
+    supabase_service_role_key: str | None = None
+
+    # The private bucket media objects go to. A setting rather than a constant
+    # so staging and production cannot end up writing into the same bucket.
+    supabase_storage_bucket: str = "memoir-media"
+
+    # How long a signed download URL stays valid, in seconds. Long enough that
+    # a photo does not expire while someone is reading the page, short enough
+    # that a URL copied out of devtools stops working the same day.
+    signed_url_ttl_seconds: int = 3600
+
+    # --- AssemblyAI (transcription) -----------------------------------------
+    # The API key. A secret, though a much smaller one than the service role
+    # key above: it can spend money on this account and read the transcripts
+    # this account has made, and nothing else. Confined to
+    # src/integrations/assemblyai.py.
+    assemblyai_api_key: str | None = None
+
+    # A string WE invent, not one AssemblyAI issues.
+    #
+    # The webhook endpoint is public — it has to be, since AssemblyAI has no
+    # account here and cannot hold a token. So each job is submitted with this
+    # value as a custom header, and the endpoint checks that what comes back
+    # matches. That is the whole of its authentication, which is why it should
+    # be long and random.
+    assemblyai_webhook_secret: str | None = None
+
+    # Which model to ask for. A setting rather than a constant so the cheaper
+    # tier can be tried without a deploy. Empty means "AssemblyAI's default".
+    assemblyai_speech_model: str | None = None
+
+    # Where AssemblyAI should call back, e.g. https://api.memoirproject.co
+    #
+    # Empty in local development, and that is expected: localhost is not
+    # reachable from the internet. When this is unset no webhook is requested
+    # and the reconcile-on-read path carries the feature by itself, which is
+    # exactly why that path exists.
+    public_base_url: str | None = None
+
+    # The kill switch. Set false and uploads still work, transcripts are marked
+    # 'skipped', and nothing is spent.
+    transcription_enabled: bool = True
+
     # Registers POST /dev/signin. Off unless explicitly switched on, so the
     # route cannot exist in production by accident. See src/api/dev.py.
     enable_dev_routes: bool = False
@@ -54,6 +110,25 @@ class Settings(BaseSettings):
         without holding any secret capable of forging one.
         """
         return f"{self.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
+
+    @property
+    def supabase_storage_url(self) -> str:
+        """Base URL of the Storage REST API for this project."""
+        return f"{self.supabase_url.rstrip('/')}/storage/v1"
+
+    @property
+    def assemblyai_webhook_url(self) -> str | None:
+        """Where AssemblyAI should POST a finished transcript, or None.
+
+        None whenever the public base URL or the shared secret is missing —
+        the normal state on a laptop. Submitting a webhook URL that cannot be
+        reached, or one with no secret to verify, is worse than submitting
+        none: the job still succeeds and the result still arrives, just by the
+        poll path instead.
+        """
+        if not self.public_base_url or not self.assemblyai_webhook_secret:
+            return None
+        return f"{self.public_base_url.rstrip('/')}/webhooks/assemblyai"
 
     @property
     def supabase_issuer(self) -> str:

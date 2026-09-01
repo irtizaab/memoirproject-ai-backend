@@ -11,7 +11,11 @@ import logging
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from src.api.dependencies import CurrentUser, current_user
-from src.domain.memoirs.memoir_service import DraftIncomplete, claim_draft
+from src.domain.memoirs.memoir_service import (
+    AlreadyHasMemoir,
+    DraftIncomplete,
+    claim_draft,
+)
 from src.models.memoir_models import ClaimRequest, MemoirSummary
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,18 @@ def post_claim(
             user_id=user.id,
             email=user.email,
             full_name=user.full_name,
+        )
+    except AlreadyHasMemoir:
+        # An account owns one memoir. Not an error in the sense of something
+        # having gone wrong — they already have what they were trying to make,
+        # and the useful thing is to say so and point at it.
+        #
+        # 409 rather than 400: the request was well-formed, it conflicts with
+        # state that already exists. The draft is left unclaimed, so nothing was
+        # consumed by the attempt.
+        raise HTTPException(
+            status_code=409,
+            detail="this account already has a memoir",
         )
     except DraftIncomplete:
         # The draft is real and it is yours, but it is not finished. A 400 with

@@ -10,10 +10,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.accounts import router as accounts_router
+from src.api.billing import router as billing_router
+from src.api.contributors import router as contributors_router
 from src.api.drafts import router as drafts_router
 from src.api.health import router as health_router
 from src.api.links import router as links_router
+from src.api.media import router as media_router
 from src.api.memoirs import router as memoirs_router
+from src.api.memories import router as memories_router
+from src.api.webhooks import router as webhooks_router
 from src.core.app_lifespan import lifespan
 from src.core.config import settings
 from src.core.error_handlers import register_error_handlers
@@ -56,6 +61,11 @@ app.include_router(drafts_router)      # POST  /drafts, PATCH /drafts/{id}
 app.include_router(memoirs_router)     # POST  /memoirs/claim         (auth)
 app.include_router(accounts_router)    # GET   /me                    (auth)
 app.include_router(links_router)       # GET   /j/{token}             (public)
+app.include_router(memories_router)    # memories: owner-side and contributor
+app.include_router(media_router)       # POST  /media/uploads  (either credential)
+app.include_router(contributors_router)  # contributors list, link reissue (auth)
+app.include_router(webhooks_router)    # POST  /webhooks/assemblyai  (secret hdr)
+app.include_router(billing_router)     # GET /plans (public), /billing + PATCH (auth)
 
 # Development-only routes, registered only when explicitly switched on.
 #

@@ -74,6 +74,20 @@ def verify_access_token(token: str) -> dict:
             algorithms=_ALLOWED_ALGORITHMS,
             audience="authenticated",
             issuer=settings.supabase_issuer,
+            # Tolerate a small clock difference between Supabase and this
+            # machine.
+            #
+            # This is not theoretical politeness. Supabase's clock runs about a
+            # second ahead of ours, and PyJWT refuses a token whose `iat` is in
+            # the future. Without leeway, the very first request made with a
+            # freshly minted token gets a 401 and every request after it
+            # succeeds — which lands squarely on `POST /memoirs/claim`, the one
+            # call the frontend makes the instant someone signs up.
+            #
+            # 30 seconds is the usual allowance: wide enough to absorb ordinary
+            # drift between two servers, narrow enough that an expired token is
+            # still refused promptly.
+            leeway=30,
             # Refuse a token that omits either of these rather than treating a
             # missing claim as "fine". A token with no `exp` never expires.
             options={"require": ["exp", "sub"]},

@@ -61,31 +61,102 @@ client, not the primary defense.
 
 ## Current state (update this section as you build)
 
-Built and working — slice 1 is complete end to end:
+Slices 1 and 2 are complete end to end. Slice 2 is what makes the invite link
+do something: memories, media, contributors and plans.
 
+**Onboarding and identity**
 - `GET /health` — confirms the API can reach Postgres
-- `POST /drafts`, `PATCH /drafts/{draft_id}` — the pre-signup onboarding
-  answers, authorized by a token header (`X-Draft-Token`), not a login
+- `POST /drafts`, `PATCH /drafts/{draft_id}` — pre-signup answers, authorized
+  by `X-Draft-Token`, not a login
 - **Supabase JWT verification.** The project signs with **ES256** and publishes
   a JWKS, so the API verifies against Supabase's *public* key and holds no
-  secret capable of forging a token. Keys are cached in-process for 5 minutes,
-  so this is not a network call per request.
-- `POST /memoirs/claim` — the atomic transaction that turns a draft plus an
-  authenticated user into `user_account` + `memoir` + owner `memoir_participant`
-  + `memoir_link`. Requires **both** a bearer token (who you are) and
-  `X-Draft-Token` (which browser session started this draft).
-- `GET /me` — the caller's identity plus the memoirs they own, for the
-  dashboard. Returns 200 with an empty list for a user who has signed up but
-  claimed nothing; that is a normal state, not a 404.
-- `GET /j/{token}` — link resolution for contributors. The **only**
-  unauthenticated route, by design. Bumps `open_count`, honours `revoked_at`,
-  and is filtered by a `response_model` so the owner's private `never_forget`
-  cannot leak.
-- `POST /dev/signin` — dev-only token minting, registered **only** when
-  `ENABLE_DEV_ROUTES=true`. The import itself sits inside the `if`, so the
-  module is never loaded in production.
-- A central `psycopg.Error` handler mapping SQLSTATE codes to clean 4xx JSON
-  responses instead of raw 500s, in `src/core/error_handlers.py`
+  secret capable of forging a token. Keys cached in-process for 5 minutes.
+  `leeway=30` on the decode, because Supabase's clock runs slightly ahead of
+  ours and without it the *first* request made with a freshly minted token 401s
+  — which lands squarely on `POST /memoirs/claim`.
+- `POST /memoirs/claim` — the atomic transaction turning a draft plus an
+  authenticated user into `user_account` + `memoir` + owner participant + link
+- `GET /me` — identity plus owned memoirs. 200 with an empty list for someone
+  who signed up and claimed nothing; a normal state, not a 404.
+- `POST /dev/signin` — dev-only token minting, registered only when
+  `ENABLE_DEV_ROUTES=true`. The import sits inside the `if`.
+
+**Memories and media** (migration `0003`)
+- `GET`/`POST /memoirs/{id}/memories`, `GET`/`PATCH`/`DELETE /memories/{id}` —
+  the owner's side. The single `GET` exists for the drill-down page: the list
+  already carries everything, so it is only reached by a link opened directly
+  or a refresh.
+- **One memory holds writing, photographs and recordings together**, in any
+  combination. `media_asset.memory_id` was always one-to-many; what changed is
+  that `memory.kind` stopped being a field the client sends.
+- **`kind` is derived, never chosen** — `_derive_kind()` reads what the memory
+  actually holds: any audio → `voice`, else any image → `photo`, else `text`.
+  It is the *primary medium*, and its only job is the eyebrow on an archive
+  card. No `mixed` value: that would need a migration for a word nobody should
+  read above their grandmother's memory.
+  The asset query is filtered on `memoir_id`, so an id from another memoir
+  matches nothing and cannot influence the answer.
+- **A memory must hold something.** No text and no assets raises `EmptyMemory`
+  → **400**. Note this and the database's `memory_text_has_body` agree by
+  construction: `text` is derived only when no asset survived the filter, so a
+  `text` row must carry words or it was rejected a line earlier.
+- `POST /media/uploads` + `/complete` — signed direct-to-storage uploads.
+  Accepts **either** an owner's bearer token or a contributor's `X-Link-Token`.
+- `POST /j/{token}/memories` — a contributor with no account leaves a memory
+  and receives a `participant_token`, so a return visit is the same person.
+- `GET /j/{token}/memories` — scoped to that one participant. A contributor can
+  see what they added and nothing else.
+
+**Contributors and plans** (migrations `0004`, `0005`)
+- `GET /memoirs/{id}/contributors` — participants with memory counts, plus the
+  live link. Never exposes `contributor_token`.
+- `POST /memoirs/{id}/link/reissue` — revoke and replace, in one transaction.
+- `GET /plans` — **public.** The price list. Public because onboarding's pricing
+  screen reads it, and that screen should not depend on where it happens to sit
+  relative to signup.
+- `GET /billing` — the plan and a **real** storage meter, summed from confirmed
+  uploads.
+- `PATCH /billing/plan` — moves the account onto a term. An *entitlement*
+  change, not a charge: the response still reports `payments_enabled: false`
+  with no renewal date. It exists so the billing screen quotes the term chosen
+  on the pricing screen. 404 covers both "no account yet" and "no such plan",
+  deliberately undistinguished.
+
+Keepsake bills monthly ($3) or yearly ($30) — two `plan` rows sharing a name, a
+tagline and a 10 GiB entitlement, differing only in `billing_interval`. Two rows
+rather than a second price column because `user_account.plan_code` has to point
+at exactly one of them, and a column cannot be pointed at.
+
+**Transcription** (migration `0006`)
+- Every confirmed **audio** upload is submitted to AssemblyAI automatically,
+  from a `BackgroundTask` at the end of `POST /media/uploads/{id}/complete`, so
+  confirming an upload stays as fast as it was.
+- **We send a signed URL, not bytes.** AssemblyAI fetches the object from
+  storage itself, so the audio never passes through this API a second time.
+- `POST /webhooks/assemblyai` — public, authenticated by a secret *we* invent
+  and submit with each job, compared back with `hmac.compare_digest`. Returns
+  200 for everything except a bad secret: a webhook sender reads a non-2xx as
+  "retry", so an endpoint that 500s on a payload it dislikes arranges to be
+  sent that payload for hours.
+- **The webhook has a twin.** `refresh_pending()` runs on both memory-list
+  routes and chases anything still `processing` after ~8s, bounded to 3 jobs
+  per request. It costs nothing when nothing is pending, it is how a laptop
+  with no public URL gets transcripts at all, and it is the safety net for a
+  webhook that got lost. Both paths write through the **same** `apply_result()`
+  — one function, two callers, so they cannot drift.
+- The transcript reaches the frontend on `MediaAsset.transcript`. `provider_id`
+  and `error` are filtered out by `response_model`, like `storage_path`.
+
+Stored: text plus **paragraph** segments. Not word-level timings — that array is
+~750 KB per audio hour, fifteen times the transcript itself. See the header of
+`src/integrations/assemblyai.py`.
+
+`language_detection` is on rather than a hardcoded `en`. These subjects do not
+all speak English, and asking for English transcription of Urdu does not fail —
+it returns fluent, confident nonsense, which is worse.
+
+Throughout: a central `psycopg.Error` handler mapping SQLSTATE codes to clean
+4xx JSON responses instead of raw 500s, in `src/core/error_handlers.py`.
 
 File layout:
 
@@ -100,14 +171,30 @@ src/
   integrations/
     db.py                            db() connection, ping()
     supabase_auth.py                 verify_access_token(), password_signin()
+    supabase_storage.py              signed upload/download URLs, object_size()
+    assemblyai.py                    submit(), fetch(), paragraphs()
   models/
     draft_models.py                  DraftUpdate
     memoir_models.py                 ClaimRequest, MemoirSummary, AccountOverview,
                                      LinkInvitation
+    memory_models.py                 Memory, MemoryCreate, ContributedMemory,
+                                     MediaAsset, Transcript, UploadRequest/Ticket,
+                                     StorageUsage
+    account_models.py                Contributor, ShareLink, Plan, BillingOverview
   domain/
     drafts/draft_service.py          create_draft(), update_draft()
-    memoirs/memoir_service.py        claim_draft(), list_memoirs_for_owner()
+    memoirs/memoir_service.py        claim_draft(), list_memoirs_for_owner();
+                                     raises AlreadyHasMemoir (one per account)
+    memoirs/access.py                owned_memoir(), contributable_memoir() —
+                                     the two ways to prove you may write
     links/link_service.py            resolve_link()
+    memories/memory_service.py       memories, owner-side and contributor-side;
+                                     _derive_kind() decides what a memory *is*
+    media/media_service.py           begin_upload(), complete_upload()
+    contributors/contributor_service.py  list_contributors(), reissue_link()
+    billing/billing_service.py       get_billing_overview(), list_plans(), set_plan()
+    transcripts/transcript_service.py  request_transcription(), apply_result(),
+                                     reconcile(), refresh_pending()
   api/
     dependencies.py                  current_user -> CurrentUser (401s live here)
     health.py                        GET  /health
@@ -115,6 +202,12 @@ src/
     memoirs.py                       POST /memoirs/claim          (auth)
     accounts.py                      GET  /me                     (auth)
     links.py                         GET  /j/{token}              (public)
+    memories.py                      memories, both audiences
+    media.py                         uploads, either credential
+    contributors.py                  contributors list, link reissue (auth)
+    billing.py                       GET  /plans                  (public)
+                                     GET  /billing, PATCH /billing/plan (auth)
+    webhooks.py                      POST /webhooks/assemblyai    (secret header)
     dev.py                           POST /dev/signin             (gated)
 ```
 
@@ -122,48 +215,93 @@ The `example_*` files alongside these are leftover template scaffolding, kept
 as a reference. They are not wired into the app.
 
 Environment variables (`.env`): `DATABASE_URL`, `SUPABASE_URL`,
-`SUPABASE_ANON_KEY`, `ENABLE_DEV_ROUTES`. Neither Supabase value is a secret —
-both ship in every frontend bundle. The API deliberately does **not** hold the
-service role key for auth; it only verifies.
+`SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `ENABLE_DEV_ROUTES`,
+`ASSEMBLYAI_API_KEY`, `ASSEMBLYAI_WEBHOOK_SECRET`, `PUBLIC_BASE_URL`,
+`TRANSCRIPTION_ENABLED`.
+
+`PUBLIC_BASE_URL` is deliberately **empty in local development** — localhost is
+not reachable from the internet, so no webhook is requested and the poll path
+does the work. No tunnel is needed to develop or test this.
+
+The first three are **not** secrets — the URL and anon key ship in every
+frontend bundle, and token verification uses the public JWKS. The service role
+key **is** a secret, is the only one this app holds, and exists for exactly one
+reason: signing upload URLs for contributors, who have no token of their own.
+It is confined to `src/integrations/supabase_storage.py`. Never log it, never
+return it, never send it to the browser.
+
+Storage: a private Supabase bucket named by `SUPABASE_STORAGE_BUCKET`
+(default `memoir-media`). The database holds paths and metadata; the bytes
+never pass through this API in either direction.
 
 Not built yet:
-- Everything past slice 1: memories, media, chapters, comments, billing.
-  Migration `0001` has no tables for any of it, on purpose.
-- Google OAuth. The frontend's button calls `signInWithOAuth` and is wired to
-  redirect back to `/onboarding`, but only the email provider is enabled on the
-  Supabase project, so it currently answers "provider is not enabled". Nothing
-  in this API needs changing when it is switched on — a Google-issued JWT
-  verifies identically.
-- The contribute flow. `GET /j/{token}` resolves and the frontend renders an
-  invitation page, but there is nowhere to submit a memory yet.
-- Link revocation and re-issue. `memoir_link.revoked_at` is honoured
-  everywhere but no endpoint sets it yet.
-
-Known limitation, not a bug:
-- Claiming the same draft twice returns 404 rather than the memoir it already
-  created. `memoir` has no `from_draft_id` column, so the second request has no
-  way to find the first one's result. Making it idempotent would need a schema
-  change; the frontend should call `GET /me` instead.
-
-Resolved:
-- `subject_is_living` is now in `DraftUpdate`, and migration
-  `0002_living_nullable.sql` is applied. The years wheel's "Present" option
-  persists as `subject_is_living = true` with a null `through_year`; picking a
-  year gives `false` plus that year; never touching the wheel leaves both null.
-  Nullable because "we didn't ask" and "no, they have died" are different
-  answers. Postgres enforces the pairing via `draft_living_has_no_end_year`.
+- **Stripe.** `GET /billing` reports `payments_enabled: false` and a null
+  renewal date, and `PATCH /billing/plan` takes no money — it records which term
+  was chosen so the billing screen agrees with the pricing screen. Migrations
+  `0004`/`0005` deliberately have no `subscription` table — the entitlement
+  (what you get) is separate from the subscription (what you pay), so adding
+  payments adds a table beside `plan` and changes nothing here.
+- Chapters, comments, publishing, and PDF export.
+- **Chapter assembly.** Transcription is done; turning many contributions into
+  chapters is not. That step reads the whole archive — typed memories and photo
+  captions included, which AssemblyAI has never seen — so it is a direct Claude
+  call, not AssemblyAI's LeMUR. Deliberately no `entity_detection`,
+  `summarization` or `auto_chapters` on the transcript job: each is billed per
+  audio hour on top, and the assembly step extracts the same facts across more
+  material.
+- **Transcript editing.** Transcripts are machine input, read-only. Correction
+  happens once, at the assembly step, rather than by asking a grieving family to
+  proofread every recording.
+- Google OAuth. Only the email provider is enabled on the Supabase project. A
+  Google-issued JWT verifies identically, so nothing here changes.
+- **Cleanup of abandoned uploads.** An upload reserved and never confirmed
+  leaves a `media_asset` row with a null `uploaded_at`. It counts towards
+  nobody's storage, but it accumulates. Needs somewhere to run scheduled work.
+  See the note at the end of `migrations/0003_memories.sql`.
 
 Frontend wiring (`memoirproject-frontend`):
-- The onboarding flow is connected end to end, pledge screen through to the
-  invite link on the dashboard. The browser talks to Supabase Auth directly and
-  sends the resulting token here; this API only verifies.
-- The frontend feature folders mirror this repo's layers:
-  `features/onboarding/` (owner, client data path — its only pre-signup
-  credential lives in localStorage) and `features/invitation/` (contributor,
-  server data path, because `GET /j/{token}` needs no auth).
+- Connected end to end: onboarding → signup → archive → invite link →
+  contributor adds a voice note or a photograph → the owner sees it.
+- Its feature folders mirror this repo's domain folders — `account/`,
+  `archive/`, `contributors/`, `billing/`, `media/`, `invitation/`,
+  `onboarding/`. `invitation/` is the only one with a server data path, because
+  `GET /j/{token}` is the only endpoint needing no credential.
+- The browser talks to Supabase Auth directly and sends the resulting token
+  here; this API only verifies. Uploads go **straight from the browser to
+  storage** using a URL this API signs — the bytes never pass through here.
 - Per-step draft saves are best-effort and not awaited; the complete answer set
   is re-sent immediately before `claim`, so a dropped save cannot corrupt the
   memoir.
+
+**One memoir per account** (migration `0007`)
+- `memoir_one_per_account`, a UNIQUE index on `memoir(created_by_user_id)`.
+- `claim_draft` checks it first and raises `AlreadyHasMemoir` → **409**, so the
+  frontend can say "you already have a memoir" and link to the archive rather
+  than showing the generic `already_exists` the 23505 handler would produce.
+- **Why it exists:** `useActiveMemoir` renders `memoirs[0]`. A second memoir
+  silently became the visible one and every memory in the first stopped being
+  rendered — not deleted, just unreachable. One test account had five memoirs
+  and could see one. That is data loss wearing the costume of a display bug.
+- Precedence: the guard runs before the draft is read, so an account that
+  already has a memoir gets 409 whatever is wrong with the draft. A **fresh**
+  account still gets 404 for a bad token and 400 for a nameless draft — both
+  covered by the slice-1 script.
+- Claiming the same draft twice is now 409 (was 404). The more useful of the
+  two: they already have what they were making.
+
+**Transcription budget** (migrations `0008`, `0009`)
+- `plan.transcription_minutes`, 600 for both Keepsake terms. Past it,
+  `request_transcription` records `skipped` — not `failed`, so no retry pass
+  ever spends it. The frontend says so plainly; a family that hits a ceiling
+  should know why one recording has words and another does not.
+- Consumption is **summed, never counted**: a counter has to survive a failed
+  job, a deleted memory and a duplicate webhook, and eventually it does not.
+- It prefers `transcript.audio_seconds` — which AssemblyAI reports — over
+  `media_asset.duration_ms`, which the **client** sends. A budget summed from a
+  number the limited party chooses is not a budget. The client's estimate still
+  gates admission, because the true length is unknown until a job finishes, so
+  understating a duration buys exactly one recording before the ledger corrects
+  itself. Same reasoning as `byte_size` asking storage instead of the uploader.
 
 ## Database conventions (already established — follow them, don't relitigate)
 
@@ -342,17 +480,35 @@ and `README.md` use.
   runs `echo "Add test/lint commands here"`.
 - Auth needs `PyJWT[crypto]` — plain `pip install PyJWT` omits `cryptography` and ES256
   verification fails at runtime, not at import.
+- **Clock skew is not hypothetical.** Supabase issues tokens with an `iat` about a second ahead
+  of this machine, and PyJWT refuses a token whose `iat` is in the future. The symptom is bizarre:
+  the *first* request made with a freshly minted token 401s and every one after it succeeds.
+  `verify_access_token` passes `leeway=30` for this. Do not remove it.
+- Signed storage URLs are minted **outside** the database transaction that creates the asset row.
+  Holding a Postgres connection open across an HTTP call to another service is how a connection
+  pool dies. The cost is an orphaned reservation row if signing fails, which is harmless.
 
 ### Known gaps
 
-- `subject_is_living` is missing from `DraftUpdate` in `src/models/draft_models.py`. The
-  onboarding's years wheel has a "Present" option that means exactly this, so that answer
-  currently cannot be saved. Migration `0002_living_nullable.sql` is already applied, so adding
-  the field is a one-line change. Deferred deliberately.
 - There is still **no test suite**. `.github/workflows/ci.yaml` runs
-  `echo "Add test/lint commands here"`. Slice 1 was verified by an end-to-end script driving the
-  real API against the real database, not by anything that runs in CI.
+  `echo "Add test/lint commands here"`. Both slices were verified by end-to-end scripts driving
+  the real API against the real database and real storage — 70 checks covering the happy paths,
+  the ownership boundaries (a stranger gets 404, never 403), the immutability rule (writing to a
+  published memoir is 409), revoked links, and the upload allow-list. None of it runs in CI, and
+  none of it lives in the repo.
+- **Storage cost is unbounded per account.** `plan.storage_limit_bytes` is stored and displayed,
+  and `GET /billing` reports real usage against it, but nothing refuses an upload that would
+  exceed it. The check belongs in `begin_upload()`.
+- Transcription spend is now bounded by `plan.transcription_minutes` (600).
+  `TRANSCRIPTION_ENABLED=false` remains the blunt kill switch.
+- **An abandoned upload is still transcribed.** Transcription fires when the
+  object is confirmed in storage, which is before a memory adopts it, so a
+  reservation nobody attaches to anything is paid for once. Same orphan class as
+  above, now with a cost attached.
+- **A failed transcript is never retried.** Nothing re-submits it.
 - CORS is still `allow_origins=["*"]`. Tolerable while auth is a header token and not a cookie;
   must become the real frontend origin before deploying.
 - `db()` opens a fresh connection per call with no pooling. Fine at current traffic; when it
   stops being fine, a pool goes in `src/integrations/db.py` and every caller keeps working.
+- A contributor's `participant_token` never expires and cannot be revoked individually. Revoking
+  the share link stops new contributions from everyone at once, which is the only lever there is.

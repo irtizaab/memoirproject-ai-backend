@@ -19,6 +19,21 @@ class DraftIncomplete(Exception):
     """
 
 
+class AlreadyHasMemoir(Exception):
+    """This account already owns a memoir, and an account may own one.
+
+    Checked here rather than left to the unique index, even though
+    `memoir_one_per_account` would catch it and `error_handlers.py` would turn
+    23505 into a 409. The generic handler answers `{"error": "already_exists"}`,
+    which tells a person nothing about what to do; this path can say which
+    memoir they already have and send them to it.
+
+    Why the rule exists at all: `useActiveMemoir` shows `memoirs[0]`, so a
+    second memoir silently became the visible one and every memory in the first
+    stopped rendering. Not deleted — just unreachable. See migration 0007.
+    """
+
+
 def claim_draft(
     draft_id: str,
     draft_token: str,
@@ -102,6 +117,23 @@ def claim_draft(
                 """,
                 params,
             )
+
+            # 1b. One memoir per account, checked before anything is written.
+            #
+            # The unique index would stop this anyway, but a 23505 surfacing as
+            # a generic 409 leaves the frontend nothing useful to say. Failing
+            # here means the draft is left unclaimed and the caller can be told
+            # to go to the archive they already have.
+            cur.execute(
+                """
+                SELECT id FROM memoir
+                 WHERE created_by_user_id = %(user_id)s
+                 LIMIT 1
+                """,
+                {"user_id": user_id},
+            )
+            if cur.fetchone() is not None:
+                raise AlreadyHasMemoir
 
             # 2. Claim the draft and read its answers in one atomic step.
             cur.execute(
