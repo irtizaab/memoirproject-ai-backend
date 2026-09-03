@@ -155,6 +155,47 @@ Stored: text plus **paragraph** segments. Not word-level timings — that array 
 all speak English, and asking for English transcription of Urdu does not fail —
 it returns fluent, confident nonsense, which is worse.
 
+**The finished memoir** (migration `0011`)
+- `GET /r/{token}` — **public**, the read-side twin of `GET /j/{token}`. Resolves
+  a **view**-scoped `memoir_link` into the book's covers: subject, contents,
+  the index of people, and the colophon's four numbers. `response_model` keeps
+  `never_forget` out of it, for the same reason `LinkInvitation` does — a link
+  gets forwarded, and forwarding it would forward the owner's private answer.
+- `GET /memoirs/{id}/chapters` — the same covers for the owner (auth), so they
+  can read before publishing and without a view link existing.
+- `GET /chapters/{id}`, `GET`/`POST /chapters/{id}/comments` — **either**
+  credential, the posture `media.py` already takes: an owner's bearer token or
+  `X-Link-Token`. A second parallel public router was the alternative, and that
+  is how two paths meant to return the same thing drift.
+- **Scope is load-bearing.** `readable_memoir()` requires `scope = 'view'`, next
+  to `contributable_memoir()`'s `scope = 'contribute'`. A link posted in a
+  family group chat so people can send memories must not also hand out the
+  finished book, and vice versa.
+- **A chapter is blocks, not a string.** `chapter_block` holds paragraphs,
+  pulled lines and figures in reading order; `block_source` says which *memory*
+  and which *person* each passage came from, down to a range of characters.
+  That is what makes "never fabricate" checkable by a reader rather than merely
+  asserted, and `diverges` is how the divergent-accounts rule is stored rather
+  than argued about.
+- **Character offsets are safe here because publication is immutable.** The text
+  can never move out from under an anchor, so there is no rebasing and no
+  orphaned comment. If a published chapter ever becomes editable, `block_source`
+  and `comment_thread` both need rewriting.
+- **A figure's caption is the contributor's own words**, read from the memory
+  the photograph came from. Nothing generates one — inventing a description of
+  somebody's photograph is exactly what the fabrication rule forbids.
+- **`POST /chapters/{id}/comments` is the only write a published memoir
+  accepts.** Everything else answers 409 once `status` flips. This is the layer
+  the confirm screen makes people tick a box about, and refusing it here would
+  break that sentence.
+- Comments are attributed to a `memoir_participant`, never a `user_account`,
+  and a returning reader is recognised by the same `contributor_token` they
+  already hold — `resolve_participant()`, shared with the memories path rather
+  than copied.
+- Nothing here **writes** a chapter. Assembly is still to come; rows arrive by
+  SQL. What this slice settles is the shape that step has to emit, which is the
+  part that gets expensive to change once a prompt is written against it.
+
 Throughout: a central `psycopg.Error` handler mapping SQLSTATE codes to clean
 4xx JSON responses instead of raw 500s, in `src/core/error_handlers.py`.
 
@@ -181,12 +222,16 @@ src/
                                      MediaAsset, Transcript, UploadRequest/Ticket,
                                      StorageUsage
     account_models.py                Contributor, ShareLink, Plan, BillingOverview
+    chapter_models.py                Chapter, Block, BlockSource, Figure,
+                                     CommentThread, CommentCreate/Receipt,
+                                     MemoirReading
   domain/
     drafts/draft_service.py          create_draft(), update_draft()
     memoirs/memoir_service.py        claim_draft(), list_memoirs_for_owner();
                                      raises AlreadyHasMemoir (one per account)
-    memoirs/access.py                owned_memoir(), contributable_memoir() —
-                                     the two ways to prove you may write
+    memoirs/access.py                owned_memoir(), contributable_memoir(),
+                                     readable_memoir() — the three ways to
+                                     prove you may reach a memoir
     links/link_service.py            resolve_link()
     memories/memory_service.py       memories, owner-side and contributor-side;
                                      _derive_kind() decides what a memory *is*
@@ -195,6 +240,8 @@ src/
     billing/billing_service.py       get_billing_overview(), list_plans(), set_plan()
     transcripts/transcript_service.py  request_transcription(), apply_result(),
                                      reconcile(), refresh_pending()
+    chapters/chapter_service.py      reading_for_link()/for_owner(),
+                                     get_chapter(), list_threads(), add_comment()
   api/
     dependencies.py                  current_user -> CurrentUser (401s live here)
     health.py                        GET  /health
@@ -207,6 +254,9 @@ src/
     contributors.py                  contributors list, link reissue (auth)
     billing.py                       GET  /plans                  (public)
                                      GET  /billing, PATCH /billing/plan (auth)
+    chapters.py                      GET  /r/{token}              (public)
+                                     GET  /memoirs/{id}/chapters  (auth)
+                                     chapters + comments (either credential)
     webhooks.py                      POST /webhooks/assemblyai    (secret header)
     dev.py                           POST /dev/signin             (gated)
 ```
@@ -241,14 +291,20 @@ Not built yet:
   `0004`/`0005` deliberately have no `subscription` table — the entitlement
   (what you get) is separate from the subscription (what you pay), so adding
   payments adds a table beside `plan` and changes nothing here.
-- Chapters, comments, publishing, and PDF export.
+- **Publishing and PDF export.** Nothing sets `status = 'published'`; the tests
+  reach that state through a factory. Chapters and comments now exist
+  (migration `0011`) — what is missing above them is the publish endpoint and
+  the export.
 - **Chapter assembly.** Transcription is done; turning many contributions into
   chapters is not. That step reads the whole archive — typed memories and photo
   captions included, which AssemblyAI has never seen — so it is a direct Claude
   call, not AssemblyAI's LeMUR. Deliberately no `entity_detection`,
   `summarization` or `auto_chapters` on the transcript job: each is billed per
   audio hour on top, and the assembly step extracts the same facts across more
-  material.
+  material. The shape it must emit is now fixed by migration `0011` and
+  `src/models/chapter_models.py`: ordered blocks, figures with a placement and
+  an anchor, and `block_source` rows carrying character offsets into each
+  paragraph. Write the prompt against that, not against a fresh design.
 - **Transcript editing.** Transcripts are machine input, read-only. Correction
   happens once, at the assembly step, rather than by asking a grieving family to
   proofread every recording.
@@ -263,9 +319,16 @@ Frontend wiring (`memoirproject-frontend`):
 - Connected end to end: onboarding → signup → archive → invite link →
   contributor adds a voice note or a photograph → the owner sees it.
 - Its feature folders mirror this repo's domain folders — `account/`,
-  `archive/`, `contributors/`, `billing/`, `media/`, `invitation/`,
-  `onboarding/`. `invitation/` is the only one with a server data path, because
-  `GET /j/{token}` is the only endpoint needing no credential.
+  `archive/`, `contributors/`, `billing/`, `media/`, `invitation/`, `memoir/`,
+  `onboarding/`. `invitation/` and `memoir/` are the two with a server data
+  path, for the same reason: both are addressed by a link token rather than a
+  session, so there is no browser-held credential a server render would have to
+  wait for.
+- `memoir/` reads the finished book at `/m/{token}`, against `GET /r/{token}`
+  and the chapter routes. Its README is worth reading before changing anything
+  about `block_source` here — the reader positions a photograph, a credit and a
+  comment with the same arithmetic, so the offsets in this database are the
+  thing that design rests on.
 - The browser talks to Supabase Auth directly and sends the resulting token
   here; this API only verifies. Uploads go **straight from the browser to
   storage** using a URL this API signs — the bytes never pass through here.
@@ -476,8 +539,15 @@ and `README.md` use.
   garbage. It has been rewritten as UTF-8. If you regenerate it from PowerShell, use
   `pip freeze | Out-File -Encoding utf8 requirements.txt` or the redirect will undo that.
 - `.python-version` says 3.11 and the Dockerfile uses 3.11, but the local `.venv` is 3.13.
-- There is currently **no test suite**, and CI (`.github/workflows/ci.yaml`) is a placeholder that
-  runs `echo "Add test/lint commands here"`.
+- **The test suite needs a real Postgres**, and refuses to run against one that is not named
+  `memoir_test*`. It TRUNCATEs every table between tests, so pointed at the wrong database that is
+  not a failing test — it is a family's recordings gone. Start one with
+  `docker run --name memoir-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 -d postgres:17`.
+  Without it the `db`-marked tests skip with one sentence rather than erroring, so the unit,
+  static and model tiers stay useful.
+- **CI still does not run any of it.** `.github/workflows/ci.yaml` is a placeholder that runs
+  `echo "Add test/lint commands here"`. Everything below passes on a laptop and nothing enforces
+  that it keeps passing.
 - Auth needs `PyJWT[crypto]` — plain `pip install PyJWT` omits `cryptography` and ES256
   verification fails at runtime, not at import.
 - **Clock skew is not hypothetical.** Supabase issues tokens with an `iat` about a second ahead
@@ -490,12 +560,27 @@ and `README.md` use.
 
 ### Known gaps
 
-- There is still **no test suite**. `.github/workflows/ci.yaml` runs
-  `echo "Add test/lint commands here"`. Both slices were verified by end-to-end scripts driving
-  the real API against the real database and real storage — 70 checks covering the happy paths,
-  the ownership boundaries (a stranger gets 404, never 403), the immutability rule (writing to a
-  published memoir is 409), revoked links, and the upload allow-list. None of it runs in CI, and
-  none of it lives in the repo.
+- **Nothing runs the tests but a person.** There is now a suite — 238 tests in five tiers, in
+  `tests/` — but `.github/workflows/ci.yaml` still runs `echo "Add test/lint commands here"`, so
+  every guarantee below holds only until somebody pushes without running it. Wiring the workflow
+  to `pip install -r requirements-dev.txt && pytest`, with a Postgres service container on 5433,
+  is the smallest remaining piece of this.
+
+  What the tiers cover, and why they are split:
+
+  | Tier | What it proves |
+  | --- | --- |
+  | `security/` | 96 tests, in five files. **Read these first.** Token verification against real ES256 keys (unsigned, wrong key, wrong project, wrong audience, expired, missing `sub`, and the thirty seconds of leeway) — and that every rejection looks identical from outside. Injection: a filename never reaches a storage path, partial updates drop unknown fields, `update_memory` filters column names through a hard-coded allow-list. Leakage: no response anywhere carries a `contributor_token`, a `storage_path`, `never_forget`, or a transcript's `provider_id`. Link tokens: unknown, revoked and wrong-scope are indistinguishable, and a participant token is useless on another memoir. |
+  | `api/` | 72 tests. Every endpoint at least once, answering the codes it documents — including the chapter and comment boundaries added with migration `0011` (`test_chapters.py`). Those last are really security tests wearing an `api/` label; if that file grows, split them out. |
+  | `unit/` | 37 tests. Config, models, transcript payloads — no database. |
+  | `db/` | 19 tests. That the CHECK constraints and partial indexes actually refuse what they claim to. |
+  | `static/` | 14 tests. The conventions in this file, enforced by reading the source: no SQL in `api/`, no `fastapi` in `domain/`, no memoir vocabulary in `integrations/`, no route defined in `main.py`, no blanket `except Exception`, handlers `def` and not `async def`, the service role key confined to one module, and **the API never answering 403**. |
+
+  Fixtures build rows with SQL rather than by calling the API, so a test about deletion fails only
+  when deletion is broken — and so it can construct states the application cannot reach, such as a
+  published memoir, or a chapter, which nothing here writes yet. `verify_slice3.py` in the repo
+  root is the ancestor of all this: it needed a live server, live Supabase and the real production
+  database to assert the same things, and it is kept only as a reference.
 - **Storage cost is unbounded per account.** `plan.storage_limit_bytes` is stored and displayed,
   and `GET /billing` reports real usage against it, but nothing refuses an upload that would
   exceed it. The check belongs in `begin_upload()`.

@@ -60,6 +60,8 @@ _MEMORY_COLUMNS = """
     mem.body_text,
     mem.happened_on,
     mem.created_at,
+    mem.participant_id,
+    (p.role = 'owner') AS is_owner,
     p.display_name AS contributor_name,
     p.relationship::text AS contributor_relationship
 """
@@ -191,6 +193,83 @@ def _derive_kind(cur, memoir_id: str, asset_ids: list[str], body_text: str | Non
     if "image" in kinds:
         return "photo"
     return "text"
+
+
+def _rederive_kind(cur, memory_id: str) -> None:
+    """Work out what a memory *is* again, after its contents changed.
+
+    `_derive_kind` answers this once, at creation, from the assets being
+    adopted. Editing can change the answer — pull the last photograph off a
+    memory that also holds words and it stops being a `photo` and becomes a
+    `text` — and a stale `kind` is the eyebrow on the archive card describing
+    something the memory no longer contains.
+
+    Raises EmptyMemory when the edit would leave nothing at all. Note where
+    that lands: inside the caller's transaction, before it commits, so the
+    delete or the adoption that caused it is rolled back and the file is still
+    there. Refusing after the fact would be no refusal.
+
+    The asset query filters on `uploaded_at IS NOT NULL` to match what
+    `_attach_assets` actually renders — a reservation that never became a file
+    must not make this a photo memory.
+    """
+    cur.execute(
+        "SELECT body_text FROM memory WHERE id = %(memory_id)s",
+        {"memory_id": memory_id},
+    )
+    memory = cur.fetchone()
+    if memory is None:
+        return
+
+    cur.execute(
+        """
+        SELECT DISTINCT kind::text AS kind
+          FROM media_asset
+         WHERE memory_id = %(memory_id)s
+           AND uploaded_at IS NOT NULL
+        """,
+        {"memory_id": memory_id},
+    )
+    kinds = {row["kind"] for row in cur.fetchall()}
+
+    if not kinds and not (memory["body_text"] or "").strip():
+        raise EmptyMemory
+
+    if "audio" in kinds:
+        kind = "voice"
+    elif "image" in kinds:
+        kind = "photo"
+    else:
+        kind = "text"
+
+    cur.execute(
+        """
+        UPDATE memory
+           SET kind = %(kind)s::memory_kind, updated_at = now()
+         WHERE id = %(memory_id)s
+        """,
+        {"kind": kind, "memory_id": memory_id},
+    )
+
+
+def _select_memory(cur, memory_id: str) -> dict | None:
+    """One memory row with its contributor's name, by id.
+
+    The read-back every write does before returning. Written once here because
+    the two asset routes both need it; `get_memory` and `update_memory` predate
+    it and inline the same query.
+    """
+    cur.execute(
+        f"""
+        SELECT {_MEMORY_COLUMNS}
+          FROM memory mem
+          JOIN memoir_participant p
+            ON p.memoir_id = mem.memoir_id AND p.id = mem.participant_id
+         WHERE mem.id = %(memory_id)s
+        """,
+        {"memory_id": memory_id},
+    )
+    return cur.fetchone()
 
 
 def _insert_memory(cur, memoir_id: str, participant_id: str, payload: dict) -> dict:
@@ -369,7 +448,20 @@ def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
             """,
             params,
         )
-        memory = cur.fetchone()
+        if cur.fetchone() is None:
+            return None
+
+        # Clearing the words off a memory that holds nothing else would leave
+        # it empty, which the database's `memory_text_has_body` constraint
+        # refuses anyway — but as a 400 naming a constraint, which explains
+        # nothing to whoever just emptied a box. Raising here rolls the edit
+        # back and gets the same sentence the composer gives.
+        #
+        # This also keeps `kind` honest: it is read back below rather than
+        # taken from the RETURNING above, which still carried the old value.
+        _rederive_kind(cur, memory_id)
+
+        memory = _select_memory(cur, memory_id)
         return _attach_assets(cur, [memory])[0] if memory else None
 
 
@@ -402,6 +494,87 @@ def delete_memory(memory_id: str, user_id: str) -> bool:
         delete_object(path)
 
     return True
+
+
+def attach_assets(memory_id: str, user_id: str, asset_ids: list[str]) -> dict | None:
+    """Add already-uploaded files to a memory that exists. None if not yours.
+
+    The editing half of what `create_memory` does in one go. The upload still
+    happens first — a file needs somewhere to go before it can be attached —
+    so the client uploads, gets its ids back, and sends them here.
+
+    `_adopt_assets` does the work and already carries the two filters that
+    matter: `memoir_id`, so an id from somebody else's memoir matches nothing,
+    and `memory_id IS NULL`, so a photograph cannot be moved off the memory it
+    already belongs to.
+    """
+    if not asset_ids:
+        return None
+
+    with db() as conn, conn.cursor() as cur:
+        memoir = owned_memoir_of_memory(cur, memory_id, user_id)
+        if memoir is None:
+            return None
+        if memoir["status"] == "published":
+            raise MemoirPublished
+
+        _adopt_assets(cur, str(memoir["id"]), memory_id, asset_ids)
+        _rederive_kind(cur, memory_id)
+
+        memory = _select_memory(cur, memory_id)
+        return _attach_assets(cur, [memory])[0] if memory else None
+
+
+def remove_asset(memory_id: str, user_id: str, asset_id: str) -> dict | None:
+    """Take one photograph or recording off a memory, and delete the file.
+
+    None if the memory is not yours, or if that asset is not on it.
+
+    Deleting rather than detaching. Setting `memory_id` back to NULL would
+    leave a confirmed upload belonging to nothing, still counted against the
+    owner's storage, forever — the abandoned-reservation problem, except this
+    one would be created deliberately.
+
+    The row goes inside the transaction and the object goes after it, the same
+    order and for the same reason as `delete_memory`: a failed object delete
+    costs an orphaned file, while the reverse order risks a file deleted out
+    from under a memory still on the page. The transcript needs no handling —
+    `transcript.asset_id` cascades from `media_asset`.
+
+    If removing this would leave the memory empty, `_rederive_kind` raises and
+    the whole transaction rolls back, so the file is still attached and still
+    in storage. Nothing is deleted by a request that gets a 400.
+    """
+    with db() as conn, conn.cursor() as cur:
+        memoir = owned_memoir_of_memory(cur, memory_id, user_id)
+        if memoir is None:
+            return None
+        if memoir["status"] == "published":
+            raise MemoirPublished
+
+        # `memory_id` in the WHERE is what stops an asset id from another
+        # memory being deleted through a memory the caller does own.
+        cur.execute(
+            """
+            DELETE FROM media_asset
+             WHERE id = %(asset_id)s
+               AND memory_id = %(memory_id)s
+         RETURNING storage_path
+            """,
+            {"asset_id": asset_id, "memory_id": memory_id},
+        )
+        removed = cur.fetchone()
+        if removed is None:
+            return None
+
+        _rederive_kind(cur, memory_id)
+
+        memory = _select_memory(cur, memory_id)
+        memory = _attach_assets(cur, [memory])[0] if memory else None
+        storage_path = removed["storage_path"]
+
+    delete_object(storage_path)
+    return memory
 
 
 def storage_used_bytes(user_id: str) -> int:
@@ -448,7 +621,7 @@ def contribute_memory(link_token: str, payload: dict) -> dict | None:
             return None
 
         memoir_id = str(memoir["id"])
-        participant = _resolve_contributor(
+        participant = resolve_participant(
             cur,
             memoir_id=memoir_id,
             token=payload.get("participant_token"),
@@ -464,10 +637,16 @@ def contribute_memory(link_token: str, payload: dict) -> dict | None:
         }
 
 
-def _resolve_contributor(
+def resolve_participant(
     cur, memoir_id: str, token: str | None, display_name: str
 ) -> dict:
     """Find the returning contributor, or create a new one.
+
+    Public rather than underscored, and named for a person rather than for
+    contributing, because `domain/chapters/` needs exactly this: somebody
+    leaving a comment on a finished memoir is the same anonymous person
+    arriving with the same token, and a second copy of the logic below is how
+    one of the two quietly grows a bug the other does not have.
 
     The token is matched together with `memoir_id`, which is what stops a token
     earned on one memoir being used to post into another. A token that does not
@@ -477,11 +656,37 @@ def _resolve_contributor(
 
     `first_opened_at` is stamped here because arriving with something to say is
     the strongest evidence there is that the link was opened.
+
+    ---------------------------------------------------------------------
+    The name is honoured, not discarded
+    ---------------------------------------------------------------------
+    This used to return the matched row untouched, so a returning contributor
+    who typed a different name had it silently thrown away — while the form
+    went on requiring it every visit. Asking for something and ignoring it is
+    the worse half of that; the name is now written through.
+
+    Note what that means, because it is not obvious: the name lives on the
+    person, not on each memory, so changing it **renames every memory they have
+    already left**. That is the honest reading of "this is my name" and it is
+    what the contributor screen now says out loud before they change it.
+
+    A blank or whitespace-only name leaves the stored one alone rather than
+    failing. Pydantic's `min_length=1` counts raw characters, so "   " reaches
+    here; writing it would violate `participant_name_not_blank` and cost them
+    the contribution over a stray space.
+
+    ---------------------------------------------------------------------
+    Merges are followed, one hop
+    ---------------------------------------------------------------------
+    `COALESCE(merged_into, id)` is how a device whose participant was merged
+    into another still posts as the person it was merged into. Both tokens keep
+    working and both lead to one entry — which is why the merge marks a row
+    rather than deleting it. See `migrations/0010_contributor_merge.sql`.
     """
     if token:
         cur.execute(
             """
-            SELECT id, contributor_token
+            SELECT COALESCE(merged_into, id) AS id, contributor_token
               FROM memoir_participant
              WHERE memoir_id = %(memoir_id)s
                AND contributor_token = %(token)s
@@ -491,6 +696,25 @@ def _resolve_contributor(
         )
         existing = cur.fetchone()
         if existing is not None:
+            wanted = display_name.strip()
+            if wanted:
+                # Guarded on the name actually differing, so the ordinary case
+                # — somebody adding a third memory in one sitting — is a read
+                # and not a write.
+                cur.execute(
+                    """
+                    UPDATE memoir_participant
+                       SET display_name = %(display_name)s
+                     WHERE memoir_id = %(memoir_id)s
+                       AND id = %(participant_id)s
+                       AND display_name <> %(display_name)s
+                    """,
+                    {
+                        "display_name": wanted,
+                        "memoir_id": memoir_id,
+                        "participant_id": str(existing["id"]),
+                    },
+                )
             return existing
 
         logger.info("Contributor token did not match; treating as a new person")

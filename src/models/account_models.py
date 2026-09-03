@@ -53,6 +53,18 @@ class Contributor(BaseModel):
     last_contribution_at: datetime | None
 
 
+class MergeResult(BaseModel):
+    """What merging two contributor entries actually did.
+
+    `memories_moved` is reported because the owner is about to be told a
+    number, and it should be the real one — "4 memories moved" reads very
+    differently from silence when they expected 4 and the answer was 0.
+    """
+
+    participant_id: UUID
+    memories_moved: int
+
+
 class ContributorsOverview(BaseModel):
     """Everything the contributors screen needs, in one response."""
 

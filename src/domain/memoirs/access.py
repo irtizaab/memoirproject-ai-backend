@@ -90,3 +90,40 @@ def contributable_memoir(cur, link_token: str) -> dict | None:
         {"token": link_token},
     )
     return cur.fetchone()
+
+
+def readable_memoir(cur, link_token: str) -> dict | None:
+    """The memoir a live **view** link points at. None if it cannot be used.
+
+    The read-side twin of `contributable_memoir`, and deliberately not the same
+    function with a parameter. Three things differ, and each is a decision:
+
+      - the scope is `view`, not `contribute`. A link that lets somebody add
+        memories must not also hand them the finished book, and a link posted in
+        a family group chat must not let a stranger write into the archive.
+
+      - it does **not** require `status = 'draft'`. Reading is the one thing
+        publication enables rather than forbids.
+
+      - it does not require `status = 'published'` either, so an owner can send
+        a view link to one person before sealing it. The reader says which of
+        the two it is rather than hiding the difference — see `published_at` on
+        `MemoirReading`.
+
+    Like every other function here it returns None rather than raising, and the
+    API layer turns that into 404. Unknown, revoked and wrong-scope all look
+    identical from outside, which is the point.
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.subject_name, m.born_year, m.through_year,
+               m.subject_is_living, m.published_at, m.status::text AS status
+          FROM memoir_link l
+          JOIN memoir m ON m.id = l.memoir_id
+         WHERE l.token = %(token)s
+           AND l.revoked_at IS NULL
+           AND l.scope = 'view'
+        """,
+        {"token": link_token},
+    )
+    return cur.fetchone()

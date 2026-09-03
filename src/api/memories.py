@@ -20,16 +20,19 @@ from src.api.dependencies import CurrentUser, current_user
 from src.domain.memories.memory_service import (
     EmptyMemory,
     MemoirPublished,
+    attach_assets,
     contribute_memory,
     create_memory,
     delete_memory,
     get_memory,
     list_contributions,
     list_memories,
+    remove_asset,
     update_memory,
 )
 from src.domain.transcripts.transcript_service import refresh_pending
 from src.models.memory_models import (
+    AssetAttachment,
     ContributedMemory,
     ContributionReceipt,
     Memory,
@@ -134,6 +137,10 @@ def patch_memory(
 
     try:
         memory = update_memory(str(memory_id), user.id, fields)
+    except EmptyMemory:
+        # Clearing the words off a memory that holds nothing else. Same rule
+        # and same sentence as creating one — the edit is rolled back.
+        raise HTTPException(status_code=400, detail=_EMPTY)
     except MemoirPublished:
         raise HTTPException(status_code=409, detail=_PUBLISHED)
 
@@ -156,6 +163,62 @@ def remove_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
 
     if not deleted:
         raise HTTPException(status_code=404, detail="memory not found")
+
+
+@router.post("/memories/{memory_id}/assets", response_model=Memory)
+def post_memory_assets(
+    memory_id: UUID,
+    body: AssetAttachment,
+    user: CurrentUser = Depends(current_user),
+):
+    """Add photographs or recordings to a memory that already exists.
+
+    The upload comes first, as it does when creating a memory — a file needs
+    somewhere to go before there is anything to attach it to — so the client
+    sends the asset ids it was handed back.
+
+    Ids that do not belong to this memoir, or that already belong to another
+    memory, simply match nothing. The response is the memory as it now stands,
+    so the client never has to guess what changed.
+    """
+    try:
+        memory = attach_assets(
+            str(memory_id), user.id, [str(asset_id) for asset_id in body.asset_ids]
+        )
+    except MemoirPublished:
+        raise HTTPException(status_code=409, detail=_PUBLISHED)
+
+    if memory is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return memory
+
+
+@router.delete("/memories/{memory_id}/assets/{asset_id}", response_model=Memory)
+def delete_memory_asset(
+    memory_id: UUID,
+    asset_id: UUID,
+    user: CurrentUser = Depends(current_user),
+):
+    """Remove one photograph or recording, and delete the file behind it.
+
+    Returns the memory rather than 204, unlike deleting a whole memory: what
+    is left still exists and its `kind` may have just changed, so there is
+    something meaningful to say.
+
+    400 when this would empty the memory — the same rule and the same sentence
+    as creating one, because "a memory needs something in it" does not stop
+    applying after the first save. Nothing is deleted in that case.
+    """
+    try:
+        memory = remove_asset(str(memory_id), user.id, str(asset_id))
+    except EmptyMemory:
+        raise HTTPException(status_code=400, detail=_EMPTY)
+    except MemoirPublished:
+        raise HTTPException(status_code=409, detail=_PUBLISHED)
+
+    if memory is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return memory
 
 
 # ---------------------------------------------------------------------------

@@ -54,6 +54,24 @@ class MemoryUpdate(BaseModel):
     happened_on: date | None = None
 
 
+class AssetAttachment(BaseModel):
+    """Files being added to a memory that already exists.
+
+    A separate model from `MemoryUpdate` rather than an `asset_ids` field on
+    it, because the two are different kinds of operation. An update is
+    partial — say nothing about a field and it is left alone. A list of assets
+    on a partial update would have to mean one of two things, and both are
+    wrong: either it can only ever add (so there is no way to remove), or it
+    replaces the set (so a client that forgets to send the full list silently
+    deletes somebody's photographs).
+
+    Removing is a DELETE against one asset, which is the shape that matches
+    what it does.
+    """
+
+    asset_ids: list[UUID] = Field(..., min_length=1)
+
+
 class ContributedMemory(BaseModel):
     """A memory arriving through a share link, from someone with no account.
 
@@ -70,8 +88,14 @@ class ContributedMemory(BaseModel):
     happened_on: date | None = None
     asset_ids: list[UUID] = Field(default_factory=list)
 
-    # Who this is from. Required on a first contribution; ignored afterwards in
-    # favour of the name already stored against the participant.
+    # Who this is from. Required every time, and honoured every time: a
+    # returning contributor who sends a different name is renamed.
+    #
+    # Because the name lives on the participant rather than on each memory,
+    # that renames the memories they have already left, too. Deliberate — it is
+    # the same person and this is their name — and the contributor screen says
+    # so before they change it. See `resolve_participant` in
+    # `domain/memories/memory_service.py`.
     display_name: str = Field(..., min_length=1, max_length=120)
 
     # Returned to the browser after the first contribution and sent back on
@@ -163,6 +187,24 @@ class Memory(BaseModel):
     # came from without the frontend joining anything itself.
     contributor_name: str
     contributor_relationship: str
+
+    # Which participant left it, and whether that participant is the owner.
+    #
+    # The id is what lets the owner's contributors screen show one person's
+    # memories together — grouping on `contributor_name` would merge two people
+    # who happen to share a name, which is exactly the confusion the merge flow
+    # exists to sort out.
+    #
+    # `is_owner` is a real field rather than a name comparison for the same
+    # reason. A contributor who types the owner's name is not the owner.
+    #
+    # Note this model is also the response for `GET /j/{token}/memories`, so a
+    # contributor sees both. Harmless: the id is their own row, which they
+    # already hold a token for, and `is_owner` is false for every memory they
+    # can see. Anything genuinely owner-only needs a separate model — see the
+    # note at the top of `api/memories.py`.
+    participant_id: UUID
+    is_owner: bool
 
     assets: list[MediaAsset] = Field(default_factory=list)
 

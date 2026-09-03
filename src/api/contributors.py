@@ -11,10 +11,16 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from src.api.dependencies import CurrentUser, current_user
 from src.domain.contributors.contributor_service import (
+    CannotMerge,
     list_contributors,
+    merge_participants,
     reissue_link,
 )
-from src.models.account_models import ContributorsOverview, ShareLink
+from src.models.account_models import (
+    ContributorsOverview,
+    MergeResult,
+    ShareLink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,44 @@ def get_contributors(memoir_id: UUID, user: CurrentUser = Depends(current_user))
     if overview is None:
         raise HTTPException(status_code=404, detail="memoir not found")
     return overview
+
+
+@router.post(
+    "/{memoir_id}/contributors/{loser_id}/merge-into/{winner_id}",
+    response_model=MergeResult,
+)
+def post_merge_contributors(
+    memoir_id: UUID,
+    loser_id: UUID,
+    winner_id: UUID,
+    user: CurrentUser = Depends(current_user),
+):
+    """Record that two entries in the contributors list are one person.
+
+    The same human on a second device becomes a second participant, because
+    identity is a token held in a browser and a phone and a laptop hold two.
+    This is how the owner says so.
+
+    Only the owner can do it, and only they should: two people genuinely share
+    a name, and no rule this API could apply would tell two cousins called Ali
+    apart. Nothing here matches on names — both ids are named by the caller.
+
+    400 for a request that does not make sense (merging somebody into
+    themselves, or involving the owner). 404 for a participant that is not in
+    this memoir, which stays indistinguishable from one that does not exist.
+
+    Not reversible. The frontend says so before calling it.
+    """
+    try:
+        result = merge_participants(
+            str(memoir_id), user.id, str(loser_id), str(winner_id)
+        )
+    except CannotMerge as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+    return result
 
 
 @router.post("/{memoir_id}/link/reissue", response_model=ShareLink, status_code=201)

@@ -1,0 +1,21 @@
+# Test-only dependencies. Deliberately NOT in requirements.txt.
+#
+# The Dockerfile installs requirements.txt and nothing else, so the production
+# image stays exactly as it is — no test framework, no HTTP mocking library, no
+# extra attack surface shipped to a server.
+#
+# Install with:  pip install -r requirements-dev.txt
+#
+# Note what is absent: no `cryptography` line. It is already pinned in
+# requirements.txt (PyJWT needs it for ES256), which is what lets the auth tests
+# mint real signing keys rather than mocking the thing they exist to test.
+
+-r requirements.txt
+
+pytest==8.4.2
+pytest-cov==7.0.0
+
+# Stubs httpx at the transport layer, so `integrations/assemblyai.py` and
+# `integrations/supabase_storage.py` can be exercised as written rather than
+# monkeypatched away. Nothing in the suite reaches the network.
+respx==0.22.0

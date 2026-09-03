@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.accounts import router as accounts_router
 from src.api.billing import router as billing_router
+from src.api.chapters import router as chapters_router
 from src.api.contributors import router as contributors_router
 from src.api.drafts import router as drafts_router
 from src.api.health import router as health_router
@@ -66,6 +67,7 @@ app.include_router(media_router)       # POST  /media/uploads  (either credentia
 app.include_router(contributors_router)  # contributors list, link reissue (auth)
 app.include_router(webhooks_router)    # POST  /webhooks/assemblyai  (secret hdr)
 app.include_router(billing_router)     # GET /plans (public), /billing + PATCH (auth)
+app.include_router(chapters_router)     # GET /r/{token} (public), chapters + comments
 
 # Development-only routes, registered only when explicitly switched on.
 #
