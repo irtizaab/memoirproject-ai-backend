@@ -7,16 +7,27 @@
 # a 400 happens here, and only here.
 
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from src.api.dependencies import CurrentUser, current_user
 from src.domain.memoirs.memoir_service import (
     AlreadyHasMemoir,
+    AlreadyPublished,
     DraftIncomplete,
+    NothingToPublish,
     claim_draft,
+    publish_memoir,
+    replace_passphrase,
 )
-from src.models.memoir_models import ClaimRequest, MemoirSummary
+from src.domain.memoirs.passphrase import MINIMUM_LENGTH, PassphraseTooShort
+from src.models.memoir_models import (
+    ClaimRequest,
+    MemoirPublication,
+    MemoirSummary,
+    PassphraseRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,3 +96,76 @@ async def post_claim(
         raise HTTPException(status_code=404, detail="draft not found")
 
     return memoir
+
+
+@router.post("/{memoir_id}/publish", response_model=MemoirPublication)
+async def post_publish(
+    memoir_id: UUID,
+    body: PassphraseRequest,
+    user: CurrentUser = Depends(current_user),
+):
+    """Seal the memoir and protect it with a passphrase. Owner only.
+
+    The most irreversible request in the product. Afterwards the text can never
+    change — every comment and every source in it is anchored to character
+    offsets that are only safe because of that — so the route refuses a memoir
+    with no chapters and refuses to run twice.
+
+    The response carries the view token and not the passphrase. The owner
+    chose it, and telling it back to them here would put it in a response body
+    and every log that records one.
+    """
+    try:
+        published = await publish_memoir(str(memoir_id), user.id, body.passphrase)
+    except PassphraseTooShort:
+        # Pydantic already enforces this on the way in; reaching here means the
+        # value was whitespace padded out to eight. The rule, not the value.
+        raise HTTPException(
+            status_code=400,
+            detail=f"the passphrase must be at least {MINIMUM_LENGTH} characters",
+        )
+    except NothingToPublish:
+        # 400 and a sentence: the memoir is real and it is theirs, it just has
+        # no chapters yet. Sending them to a "not found" screen would be a lie.
+        raise HTTPException(
+            status_code=400,
+            detail="assemble the memoir before publishing it",
+        )
+    except AlreadyPublished:
+        # 409 — well-formed, and conflicting with state that already exists.
+        # Forgetting the passphrase is not a reason to publish again; that is
+        # what PUT /passphrase is for.
+        raise HTTPException(status_code=409, detail="this memoir is already published")
+
+    if published is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+
+    return published
+
+
+@router.put("/{memoir_id}/passphrase", status_code=204)
+async def put_passphrase(
+    memoir_id: UUID,
+    body: PassphraseRequest,
+    user: CurrentUser = Depends(current_user),
+):
+    """Replace the passphrase. Owner only.
+
+    There is no route that reads the old one back, because nothing in the
+    building can: it is a scrypt hash. Replacing is the only move available,
+    and it locks out everyone who was told the previous one — which is what
+    somebody asking for this wants, since the usual reason to ask is that it
+    reached someone it should not have.
+
+    204: nothing to return that the caller does not already know.
+    """
+    try:
+        replaced = await replace_passphrase(str(memoir_id), user.id, body.passphrase)
+    except PassphraseTooShort:
+        raise HTTPException(
+            status_code=400,
+            detail=f"the passphrase must be at least {MINIMUM_LENGTH} characters",
+        )
+
+    if replaced is None:
+        raise HTTPException(status_code=404, detail="memoir not found")

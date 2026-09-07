@@ -291,10 +291,10 @@ Not built yet:
   `0004`/`0005` deliberately have no `subscription` table — the entitlement
   (what you get) is separate from the subscription (what you pay), so adding
   payments adds a table beside `plan` and changes nothing here.
-- **Publishing and PDF export.** Nothing sets `status = 'published'`; the tests
-  reach that state through a factory. Chapters and comments now exist
-  (migration `0011`) — what is missing above them is the publish endpoint and
-  the export.
+- **PDF export.** Publishing exists now — `POST /memoirs/{id}/publish` seals the
+  memoir, stores a scrypt hash of the owner's passphrase (migration `0012`,
+  `src/domain/memoirs/passphrase.py`, standard library only) and issues the
+  `view` link. What is still missing above it is the export.
 - **Chapter assembly by Claude.** `POST /memoirs/{id}/assemble` exists and
   writes real chapters, but it groups memories by decade rather than reading
   them: `src/domain/chapters/assembly_service.py`, and `_plan()` is the only

@@ -233,6 +233,20 @@ def db_conn():
         yield conn
 
 
+@pytest.fixture
+def db_cursor(db_conn):
+    """The same connection, one cursor deep.
+
+    Most row-level assertions are a single SELECT, and `with db_conn.cursor()`
+    around each of them says nothing a reader needs. Autocommit so that a test
+    reading twice — before a request and after it — sees what the application
+    committed in between rather than its own opening snapshot.
+    """
+    db_conn.autocommit = True
+    with db_conn.cursor() as cur:
+        yield cur
+
+
 # ---------------------------------------------------------------------------
 # Real signing keys — deliberately not a mock
 # ---------------------------------------------------------------------------

@@ -66,6 +66,21 @@ class MemoirSummary(BaseModel):
     # returns this same model a moment after the row is created.
     chapter_count: int = 0
 
+    # When it was sealed, or null while it is still a draft. `status` says the
+    # same thing, and this says *when* — which is what the dashboard prints
+    # beside the link.
+    published_at: datetime | None = None
+
+    # The token that opens the reader, distinct from `link_token` above: that
+    # one collects memories, this one hands over the finished book. Null until
+    # publication issues it.
+    #
+    # Note what is deliberately absent: `view_passphrase_hash`. It is a
+    # password hash on a row this model is built from, and `response_model`
+    # filtering is the only thing that would keep a `SELECT *` from putting it
+    # in a browser.
+    view_token: str | None = None
+
 
 class AccountOverview(BaseModel):
     """Body of GET /me — who the caller is, and what they own.
@@ -100,3 +115,37 @@ class LinkInvitation(BaseModel):
     subject_is_living: bool | None
     scope: str
     invited_by: str
+
+
+class PassphraseRequest(BaseModel):
+    """Body of POST /memoirs/{id}/publish and PUT /memoirs/{id}/passphrase.
+
+    One field, and the only password this product has. `min_length` is checked
+    here so the 422 names the field, and again in `hash_passphrase` — which is
+    the last thing between a memoir and a passphrase of "a", and is reachable
+    from anywhere.
+
+    No maximum worth enforcing below scrypt's own: a family who want a whole
+    sentence should have one, and a long passphrase is the good case.
+
+    It is never stored, never logged and never returned. The owner chooses it
+    and tells people themselves.
+    """
+
+    passphrase: str = Field(..., min_length=8, max_length=256)
+
+
+class MemoirPublication(BaseModel):
+    """What sealing a memoir gives back.
+
+    The token and the timestamp, and pointedly not the passphrase: echoing it
+    would put it in a response body, a browser cache and any log that ever
+    records one.
+
+    `view_token` and not a URL, for the reason `MemoirSummary.link_token` gives
+    — the API does not know which domain the frontend is served from, and a
+    staging deployment handing out production links would be a real bug.
+    """
+
+    view_token: str
+    published_at: datetime

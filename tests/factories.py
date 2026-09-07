@@ -20,7 +20,14 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from src.domain.memoirs.passphrase import hash_passphrase
 from tests.conftest import DB_AVAILABLE, TEST_DATABASE_URL
+
+# The passphrase every factory-built memoir is protected with, so a test that
+# wants to open the reader can say so in one word. Hashed with the real
+# function rather than a stub: a test asserting a wrong passphrase is refused
+# is only worth something if the right one is verified the real way.
+TEST_PASSPHRASE = "ellsworth lane"
 
 
 class Factory:
@@ -153,19 +160,39 @@ class Factory:
             {"id": link_id},
         )
 
-    def publish(self, memoir_id: str) -> None:
-        """Flip a memoir to published.
+    def publish(self, memoir_id: str, *, passphrase: str = TEST_PASSPHRASE) -> None:
+        """Flip a memoir to published, protected by a known passphrase.
 
-        Only reachable from here — the application has no publish endpoint yet,
-        and the CHECK constraint requires both columns to move together.
+        Three columns move together because two CHECK constraints say they
+        must: `memoir_published_at_matches_status` ties the timestamp to the
+        status, and `memoir_published_is_protected` (0012) refuses a sealed
+        memoir with no passphrase — a finished book anyone holding a forwarded
+        link could read.
+
+        The default is `TEST_PASSPHRASE`, so a test that publishes and then
+        wants to open the reader has the credential without saying so.
         """
         self._exec(
             """
             UPDATE memoir
-               SET status = 'published', published_at = now()
+               SET status = 'published',
+                   published_at = now(),
+                   view_passphrase_hash = %(hash)s
              WHERE id = %(id)s
             """,
-            {"id": memoir_id},
+            {"id": memoir_id, "hash": hash_passphrase(passphrase)},
+        )
+
+    def protect(self, memoir_id: str, *, passphrase: str = TEST_PASSPHRASE) -> None:
+        """Give a memoir a passphrase without sealing it.
+
+        The state an owner is in when they have sent a view link to one person
+        before publishing: readable by anyone who knows the passphrase, still a
+        draft, still collecting memories.
+        """
+        self._exec(
+            "UPDATE memoir SET view_passphrase_hash = %(hash)s WHERE id = %(id)s",
+            {"id": memoir_id, "hash": hash_passphrase(passphrase)},
         )
 
     # --- contributors ----------------------------------------------------

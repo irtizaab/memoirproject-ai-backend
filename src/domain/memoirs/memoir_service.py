@@ -5,6 +5,8 @@
 
 import logging
 
+from src.domain.memoirs.access import owned_memoir
+from src.domain.memoirs.passphrase import hash_passphrase
 from src.integrations.db import db
 
 logger = logging.getLogger(__name__)
@@ -266,17 +268,29 @@ async def list_memoirs_for_owner(user_id: str) -> list[dict]:
 
     `chapter_count` is a correlated subquery rather than a third join, because
     a LEFT JOIN onto chapter would multiply the memoir row by its chapters and
-    need a GROUP BY over every column above to put it back together.
+    need a GROUP BY over every column above to put it back together. The view
+    token is one for the same reason plus a second: it is a different scope of
+    the same table already joined once, and joining `memoir_link` twice reads
+    as a mistake even when it is not.
+
+    `view_passphrase_hash` is not selected. It could not reach a browser —
+    `MemoirSummary` does not declare it — but the way to be sure a password
+    hash never leaves the database is not to read it.
     """
     async with db() as conn, conn.cursor() as cur:
         await cur.execute(
             """
             SELECT m.id, m.subject_name, m.born_year, m.through_year,
                    m.subject_is_living, m.never_forget,
-                   m.status::text AS status, m.created_at,
+                   m.status::text AS status, m.created_at, m.published_at,
                    l.token AS link_token,
                    (SELECT count(*) FROM chapter c
-                     WHERE c.memoir_id = m.id) AS chapter_count
+                     WHERE c.memoir_id = m.id) AS chapter_count,
+                   (SELECT v.token FROM memoir_link v
+                     WHERE v.memoir_id = m.id
+                       AND v.scope = 'view'
+                       AND v.revoked_at IS NULL
+                     LIMIT 1) AS view_token
               FROM memoir m
               LEFT JOIN memoir_link l
                      ON l.memoir_id = m.id
@@ -288,3 +302,143 @@ async def list_memoirs_for_owner(user_id: str) -> list[dict]:
             {"user_id": user_id},
         )
         return await cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+
+class NothingToPublish(Exception):
+    """The memoir has no chapters, so there is no book to seal.
+
+    Publishing is irreversible — every rule downstream of it assumes the text
+    can never move again — and sealing an empty memoir would spend that one
+    chance on nothing. The owner is told to assemble first.
+    """
+
+
+class AlreadyPublished(Exception):
+    """It is already sealed, and sealing is not something done twice.
+
+    Distinct from a passphrase change, which is a different request and a
+    different route: forgetting the passphrase must not be a reason to
+    re-publish, because republishing is exactly what immutability forbids.
+    """
+
+
+async def publish_memoir(memoir_id: str, user_id: str, passphrase: str) -> dict | None:
+    """Seal a memoir, protect it, and return the link that opens it.
+
+    Returns `{view_token, published_at}`, or None if the memoir is not this
+    user's. Raises NothingToPublish, AlreadyPublished, or PassphraseTooShort
+    from `passphrase.hash_passphrase`.
+
+    Three things happen together and none of them is safe alone:
+
+      1. `status` and `published_at` move to published.
+      2. The passphrase hash is stored. `memoir_published_is_protected` (0012)
+         will refuse the row if this is missing, which is the point — a sealed
+         memoir with no passphrase is a book anyone holding a forwarded link
+         can read.
+      3. A live `view` link is issued if there is not one already.
+
+    One transaction, so a memoir cannot end up published with no way to open
+    it, or openable with no passphrase.
+
+    Note what is NOT here: nothing tells anybody the passphrase. It is not
+    emailed, not returned in this response, and not recoverable afterwards —
+    the owner chose it and the owner passes it on.
+    """
+    encoded = hash_passphrase(passphrase)
+
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir(cur, memoir_id, user_id)
+        if memoir is None:
+            return None
+
+        if memoir["status"] == "published":
+            raise AlreadyPublished
+
+        await cur.execute(
+            "SELECT count(*) AS n FROM chapter WHERE memoir_id = %(id)s",
+            {"id": memoir_id},
+        )
+        if (await cur.fetchone())["n"] == 0:
+            raise NothingToPublish
+
+        await cur.execute(
+            """
+            UPDATE memoir
+               SET status = 'published',
+                   published_at = now(),
+                   view_passphrase_hash = %(hash)s,
+                   updated_at = now()
+             WHERE id = %(id)s
+         RETURNING published_at
+            """,
+            {"id": memoir_id, "hash": encoded},
+        )
+        published_at = (await cur.fetchone())["published_at"]
+
+        # One live link per scope is enforced by a partial unique index, so
+        # look before inserting. An owner who was sent a view link early — to
+        # show one person before sealing — keeps the address they already gave
+        # out rather than having it silently replaced.
+        await cur.execute(
+            """
+            SELECT token FROM memoir_link
+             WHERE memoir_id = %(id)s AND scope = 'view' AND revoked_at IS NULL
+             LIMIT 1
+            """,
+            {"id": memoir_id},
+        )
+        link = await cur.fetchone()
+
+        if link is None:
+            await cur.execute(
+                """
+                INSERT INTO memoir_link (memoir_id, scope)
+                VALUES (%(id)s, 'view')
+             RETURNING token
+                """,
+                {"id": memoir_id},
+            )
+            link = await cur.fetchone()
+
+    logger.info("Published memoir %s", memoir_id)
+    return {"view_token": link["token"], "published_at": published_at}
+
+
+async def replace_passphrase(
+    memoir_id: str, user_id: str, passphrase: str
+) -> bool | None:
+    """Set a new passphrase on a memoir. Returns True, or None if not theirs.
+
+    There is no "recover" here and there cannot be: the old one is a scrypt
+    hash and nothing in the building can read it back. Replacing is the only
+    move, and it locks out everyone who was told the previous one — which is
+    the behaviour somebody asking for this actually wants, because the reason
+    they are asking is usually that it reached someone it should not have.
+
+    Allowed on a draft as well as a published memoir, so an owner who sent a
+    view link before sealing can protect it straight away.
+    """
+    encoded = hash_passphrase(passphrase)
+
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir(cur, memoir_id, user_id)
+        if memoir is None:
+            return None
+
+        await cur.execute(
+            """
+            UPDATE memoir
+               SET view_passphrase_hash = %(hash)s, updated_at = now()
+             WHERE id = %(id)s
+            """,
+            {"id": memoir_id, "hash": encoded},
+        )
+
+    logger.info("Replaced the passphrase on memoir %s", memoir_id)
+    return True
