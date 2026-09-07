@@ -18,7 +18,7 @@
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from src.api.dependencies import CurrentUser, current_user
 from src.api.media import optional_user_id
@@ -35,6 +35,7 @@ from src.domain.chapters.chapter_service import (
     reading_for_link,
     reading_for_owner,
 )
+from src.domain.chapters.export_service import NothingToExport, export_pdf
 from src.domain.chapters.reader_gate import ReaderNameRequired, open_for_reading
 from src.models.chapter_models import (
     AssemblyResult,
@@ -217,6 +218,44 @@ async def post_assemble(
         raise HTTPException(status_code=404, detail="memoir not found")
 
     return result
+
+
+@router.get(
+    "/memoirs/{memoir_id}/export.pdf",
+    response_class=Response,
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def get_export(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+    """The memoir as a file the family can keep. Owner only.
+
+    Bearer only and no link path, like assembly: a view link lets somebody read
+    the book, and handing every reader a print-ready copy of a private family
+    memoir is a different decision that nobody has made.
+
+    `Response` rather than `StreamingResponse` because the whole document is
+    already bytes in memory by the time this returns — streaming it would mean
+    holding a database connection open while a phone downloads.
+
+    `Content-Disposition: attachment` so a browser saves it under the subject's
+    name instead of rendering it in a tab called `export.pdf`.
+    """
+    try:
+        exported = await export_pdf(str(memoir_id), user.id)
+    except NothingToExport:
+        raise HTTPException(
+            status_code=400,
+            detail="assemble the memoir before exporting it",
+        )
+
+    if exported is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+
+    content, filename = exported
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -274,7 +274,8 @@ src/
     contributors.py                  contributors list, link reissue (auth)
     billing.py                       GET  /plans                  (public)
                                      GET  /billing, PATCH /billing/plan (auth)
-    chapters.py                      POST /r/{token}/open         (the door)
+    chapters.py                      GET  /memoirs/{id}/export.pdf (auth)
+                                     POST /r/{token}/open         (the door)
                                      GET  /r/{token}    (link + reader session)
                                      GET  /memoirs/{id}/chapters  (auth)
                                      POST /memoirs/{id}/assemble  (auth)
@@ -311,10 +312,13 @@ Not built yet:
   `0004`/`0005` deliberately have no `subscription` table — the entitlement
   (what you get) is separate from the subscription (what you pay), so adding
   payments adds a table beside `plan` and changes nothing here.
-- **PDF export.** Publishing exists now — `POST /memoirs/{id}/publish` seals the
-  memoir, stores a scrypt hash of the owner's passphrase (migration `0012`,
-  `src/domain/memoirs/passphrase.py`, standard library only) and issues the
-  `view` link. What is still missing above it is the export.
+- **Photographs in the PDF.** `GET /memoirs/{id}/export.pdf` builds the book
+  with ReportLab (`src/domain/chapters/export_service.py`): title page, contents
+  on page one, the prose, and every source as a numbered note under its chapter.
+  The comment layer is deliberately left out — it is the one part of a memoir
+  still growing, and printing it freezes half a conversation. The photographs
+  are left out for now because signed URLs and image scaling are their own
+  slice; the sources still name them.
 - **Chapter assembly by Claude.** `POST /memoirs/{id}/assemble` exists and
   writes real chapters, but it groups memories by decade rather than reading
   them: `src/domain/chapters/assembly_service.py`, and `_plan()` is the only
