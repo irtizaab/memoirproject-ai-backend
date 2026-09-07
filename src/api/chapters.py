@@ -18,7 +18,7 @@
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 
 from src.api.dependencies import CurrentUser, current_user
 from src.api.media import optional_user_id
@@ -36,7 +36,12 @@ from src.domain.chapters.chapter_service import (
     reading_for_owner,
 )
 from src.domain.chapters.export_service import NothingToExport, export_pdf
-from src.domain.chapters.reader_gate import ReaderNameRequired, open_for_reading
+from src.domain.chapters.reader_gate import (
+    ReaderNameRequired,
+    open_for_reading,
+    reader_participant,
+)
+from src.domain.chapters.search_service import search_memoir
 from src.models.chapter_models import (
     AssemblyResult,
     Chapter,
@@ -46,7 +51,10 @@ from src.models.chapter_models import (
     MemoirReading,
     ReaderOpen,
     ReaderSession,
+    SearchResults,
 )
+from src.domain.memoirs.access import owned_memoir, readable_memoir
+from src.integrations.db import db
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +264,53 @@ async def get_export(memoir_id: UUID, user: CurrentUser = Depends(current_user))
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Finding something in it
+# ---------------------------------------------------------------------------
+#
+# Two routes over one query, because the owner and the family search the same
+# memoir and get the same results. Anything else would have the family
+# wondering what was being kept from them — and would be two result shapes to
+# keep in step forever.
+
+
+@router.get("/memoirs/{memoir_id}/search", response_model=SearchResults)
+async def get_owner_search(
+    memoir_id: UUID,
+    q: str = Query(default="", max_length=200),
+    user: CurrentUser = Depends(current_user),
+):
+    """Search the memoir, as its owner."""
+    async with db() as conn, conn.cursor() as cur:
+        if await owned_memoir(cur, str(memoir_id), user.id) is None:
+            raise HTTPException(status_code=404, detail="memoir not found")
+
+    return await search_memoir(str(memoir_id), q)
+
+
+@router.get("/r/{token}/search", response_model=SearchResults)
+async def get_reader_search(
+    token: str,
+    q: str = Query(default="", max_length=200),
+    x_reader_token: str | None = READER_TOKEN,
+):
+    """The same search, for a reader who has been through the door.
+
+    Addressed by the link like everything else on the reader's side, and
+    needing the session for the same reason `GET /r/{token}` does: a forwarded
+    link must not become a way to search a family's memoir.
+    """
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await readable_memoir(cur, token)
+        if memoir is None:
+            raise HTTPException(status_code=404, detail="link not found")
+        if await reader_participant(cur, memoir, token, x_reader_token) is None:
+            raise HTTPException(status_code=404, detail="link not found")
+        memoir_id = str(memoir["id"])
+
+    return await search_memoir(memoir_id, q)
 
 
 # ---------------------------------------------------------------------------

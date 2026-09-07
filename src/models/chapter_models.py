@@ -351,3 +351,48 @@ class ReaderSession(BaseModel):
     # (migration 0003). For everybody else it is the same token the contribute
     # side uses, so one browser is one person across both.
     participant_token: str | None
+
+
+class SearchHit(BaseModel):
+    """One thing a search found, in whichever of the four places it lives.
+
+    One model rather than four, because "where is that story" is one question
+    and the person asking does not know which kind of thing they are looking
+    for. The fields that do not apply to a kind are null: a photograph has no
+    chapter, a paragraph has no single person to credit.
+
+    `excerpt` carries the match wrapped in two control characters rather than
+    in `<mark>`. It is built from text a reader typed, and HTML in it would
+    mean the frontend rendering user input as markup — see `search_service.py`.
+    """
+
+    kind: Literal["chapter", "photo", "recording", "reflection"]
+
+    # The row that matched: a block, a memory, or a comment.
+    id: UUID
+
+    # Where to go when it is clicked. Null on a photograph or a recording that
+    # is not in a chapter — those live in the archive rather than in the book.
+    chapter_id: UUID | None
+
+    title: str
+    year: int | None
+    excerpt: str
+
+    # Who wrote or gave it. Null on a chapter paragraph, which is assembled
+    # from several people and carries its credits on the page itself.
+    attribution: str | None
+
+
+class SearchResults(BaseModel):
+    """What a search returns, with the counts the filters are drawn from.
+
+    `counts` comes from the same rows as `hits`, so the number on a filter can
+    never disagree with what filtering by it shows — which they would, briefly
+    and inexplicably, if somebody left a comment between two queries.
+    """
+
+    query: str
+    total: int
+    counts: dict[str, int]
+    hits: list[SearchHit]
