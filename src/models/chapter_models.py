@@ -347,6 +347,13 @@ class ReaderSession(BaseModel):
     display_name: str
     is_owner: bool
 
+    # Which memoir was opened. Not needed to read it — the link says that — but
+    # the browser keys its memory of "who I am here" on the memoir rather than
+    # on the link, so that reissuing a link does not turn every contributor
+    # into a stranger (see `features/invitation/contributorStorage.ts`). This
+    # is the only way the reader's side learns it.
+    memoir_id: UUID
+
     # Null for the owner, whose participant row is forbidden from carrying one
     # (migration 0003). For everybody else it is the same token the contribute
     # side uses, so one browser is one person across both.

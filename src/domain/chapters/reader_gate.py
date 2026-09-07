@@ -174,6 +174,7 @@ async def open_for_reading(
                 "reader_token": issue(memoir_id, str(owner["id"]), link_token, stored),
                 "display_name": owner["display_name"],
                 "is_owner": True,
+                "memoir_id": memoir_id,
                 # None, and the CHECK in migration 0003 is why: an owner never
                 # holds a contributor token.
                 "participant_token": None,
@@ -244,6 +245,7 @@ async def open_for_reading(
             "reader_token": issue(memoir_id, participant_id, link_token, stored),
             "display_name": name,
             "is_owner": False,
+            "memoir_id": memoir_id,
             # Handed back so the same browser is the same person on the
             # contribute side too — somebody who sent memories months ago and
             # reads today must not appear in the memoir twice.
