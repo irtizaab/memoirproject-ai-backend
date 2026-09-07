@@ -16,29 +16,26 @@
 # ---------------------------------------------------------------------------
 # Nothing in this file writes a chapter
 # ---------------------------------------------------------------------------
-# Assembly — the Claude call that reads the whole archive and produces blocks
-# with attributed spans — is a later slice. Chapters arrive by SQL until then.
-# What this file settles is the shape that step has to emit, which is the part
-# that gets expensive to change once a prompt is written against it.
+# That belongs to `assembly_service.py` beside it, which fills these tables from
+# the archive. What this file settles is the shape that step has to emit, which
+# is the part that gets expensive to change once a prompt is written against it.
+#
+# ---------------------------------------------------------------------------
+# A link is no longer enough
+# ---------------------------------------------------------------------------
+# Every link-addressed read below takes a reader session as well as the token.
+# The session is issued by `reader_gate.open_for_reading` in exchange for the
+# passphrase and a name, so a forwarded link opens nothing on its own and
+# nobody reads a family memoir anonymously.
 
 import logging
 
+from src.domain.chapters.reader_gate import reader_participant
 from src.domain.memoirs.access import owned_memoir, readable_memoir
-from src.domain.memories.memory_service import resolve_participant
 from src.integrations.db import db
 from src.integrations.supabase_storage import create_signed_download_urls
 
 logger = logging.getLogger(__name__)
-
-
-class NameRequired(Exception):
-    """A reader tried to comment without saying who they are.
-
-    Only reachable on the link path. The owner is already named by their token;
-    somebody arriving by link has nothing else identifying them, and an
-    unattributed comment in a memoir is worse than no comment — the whole
-    product is about who said what.
-    """
 
 
 class SpanOutOfRange(Exception):
@@ -57,7 +54,11 @@ class SpanOutOfRange(Exception):
 
 
 async def _reachable_chapter(
-    cur, chapter_id: str, user_id: str | None, link_token: str | None
+    cur,
+    chapter_id: str,
+    user_id: str | None,
+    link_token: str | None,
+    reader_token: str | None = None,
 ) -> dict | None:
     """The chapter, if this caller may read it. None otherwise.
 
@@ -67,6 +68,15 @@ async def _reachable_chapter(
 
     Both branches join back up to `memoir`, so a chapter id from somebody
     else's memoir matches nothing rather than matching on the id alone.
+
+    The link branch needs two things now, not one. The token says which memoir;
+    the reader session says who is holding it, and it is only issued by
+    `reader_gate.open_for_reading` against the passphrase. A link on its own
+    stopped being enough the moment the product started handing links to
+    families to forward.
+
+    `_reader_participant` is returned on the row so callers that need to know
+    who is reading — the comment path — do not resolve the session twice.
     """
     if user_id is not None:
         await cur.execute(
@@ -82,6 +92,7 @@ async def _reachable_chapter(
         )
         row = await cur.fetchone()
         if row is not None:
+            row["_reader_participant"] = None
             return row
 
     if link_token is not None:
@@ -100,6 +111,14 @@ async def _reachable_chapter(
         )
         row = await cur.fetchone()
         if row is not None:
+            participant = await reader_participant(
+                cur, {"id": row["memoir_id"]}, link_token, reader_token
+            )
+            if participant is None:
+                # A live link and no session. Indistinguishable from a link
+                # that opens nothing, which is the whole point of the door.
+                return None
+            row["_reader_participant"] = participant
             return row
 
     return None
@@ -221,11 +240,18 @@ async def reading_for_owner(memoir_id: str, user_id: str) -> dict | None:
         return await _reading(cur, await cur.fetchone())
 
 
-async def reading_for_link(link_token: str) -> dict | None:
-    """The covers, for anybody holding a live view link. None if it is dead."""
+async def reading_for_link(link_token: str, reader_token: str | None) -> dict | None:
+    """The covers, for a reader who has been through the door.
+
+    None if the link is unknown, revoked, the wrong scope, or if the session
+    does not hold — one answer for all of them, so a leaked link cannot be
+    told apart from a made-up one.
+    """
     async with db() as conn, conn.cursor() as cur:
         memoir = await readable_memoir(cur, link_token)
         if memoir is None:
+            return None
+        if await reader_participant(cur, memoir, link_token, reader_token) is None:
             return None
         return await _reading(cur, memoir)
 
@@ -413,11 +439,17 @@ def _told_by(sources_by_block: dict) -> tuple[list[str], int]:
 
 
 async def get_chapter(
-    chapter_id: str, *, user_id: str | None = None, link_token: str | None = None
+    chapter_id: str,
+    *,
+    user_id: str | None = None,
+    link_token: str | None = None,
+    reader_token: str | None = None,
 ) -> dict | None:
     """One chapter, with its photographs, its sources and its conversation."""
     async with db() as conn, conn.cursor() as cur:
-        chapter = await _reachable_chapter(cur, chapter_id, user_id, link_token)
+        chapter = await _reachable_chapter(
+            cur, chapter_id, user_id, link_token, reader_token
+        )
         if chapter is None:
             return None
 
@@ -477,7 +509,11 @@ async def get_chapter(
 
 
 async def list_threads(
-    chapter_id: str, *, user_id: str | None = None, link_token: str | None = None
+    chapter_id: str,
+    *,
+    user_id: str | None = None,
+    link_token: str | None = None,
+    reader_token: str | None = None,
 ) -> list[dict] | None:
     """Just the conversation.
 
@@ -487,7 +523,10 @@ async def list_threads(
     photograph to find out.
     """
     async with db() as conn, conn.cursor() as cur:
-        if await _reachable_chapter(cur, chapter_id, user_id, link_token) is None:
+        reachable = await _reachable_chapter(
+            cur, chapter_id, user_id, link_token, reader_token
+        )
+        if reachable is None:
             return None
         return await _threads(cur, chapter_id)
 
@@ -545,11 +584,18 @@ async def add_comment(
     *,
     user_id: str | None = None,
     link_token: str | None = None,
+    reader_token: str | None = None,
 ) -> dict | None:
     """Leave a comment, starting a thread or replying to one.
 
-    Returns the thread as it now stands plus the token that makes this person
-    the same person next time, or None if the chapter cannot be reached.
+    Returns the thread as it now stands, or None if the chapter cannot be
+    reached.
+
+    Nobody says who they are here any more. They said it at the door, and the
+    reader session carries it — which is what makes every reflection in a
+    memoir signed rather than optionally signed. Before the door existed a
+    person could read the whole book as nobody at all and be asked their name
+    only if they had something to say.
 
     One transaction throughout. A thread created and then failing to receive
     its first comment would be an empty conversation nobody can delete, in a
@@ -562,27 +608,23 @@ async def add_comment(
     too, so an owner can send a view link to one person and hear back.
     """
     async with db() as conn, conn.cursor() as cur:
-        chapter = await _reachable_chapter(cur, chapter_id, user_id, link_token)
+        chapter = await _reachable_chapter(
+            cur, chapter_id, user_id, link_token, reader_token
+        )
         if chapter is None:
             return None
 
         memoir_id = str(chapter["memoir_id"])
 
         # --- who is talking ------------------------------------------------
+        #
+        # Both answers were settled before this request. The owner is named by
+        # their account; a reader was named at the door and their session says
+        # which participant row that made them.
         if user_id is not None:
-            participant = await _owner_participant(cur, memoir_id)
-            participant_token = None
+            participant_id = str((await _owner_participant(cur, memoir_id))["id"])
         else:
-            display_name = (payload.get("display_name") or "").strip()
-            if not display_name:
-                raise NameRequired
-            participant = await resolve_participant(
-                cur,
-                memoir_id=memoir_id,
-                token=payload.get("participant_token"),
-                display_name=display_name,
-            )
-            participant_token = participant["contributor_token"]
+            participant_id = chapter["_reader_participant"]
 
         # --- which conversation --------------------------------------------
         thread_id = payload.get("thread_id")
@@ -612,15 +654,12 @@ async def add_comment(
             {
                 "memoir": memoir_id,
                 "thread": thread_id,
-                "participant": str(participant["id"]),
+                "participant": participant_id,
                 "body": payload["body"].strip(),
             },
         )
 
-        return {
-            "thread": await _one_thread(cur, thread_id),
-            "participant_token": participant_token,
-        }
+        return {"thread": await _one_thread(cur, thread_id)}
 
 
 async def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | None:

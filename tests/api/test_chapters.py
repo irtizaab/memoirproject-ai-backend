@@ -7,10 +7,15 @@ every chapter here is built by the factory, the same way `publish()` builds a
 state the API cannot reach. What is under test is the read path and the shape
 it returns — the contract the assembly step will have to satisfy.
 
-**Two credentials reach the same rows.** An owner's bearer token and a live
-*view* link both open a chapter. Most tests below are written twice for that
-reason, because "it works for the owner" has never implied "and it works for
-the family", and the family are the ones the product is for.
+**Two credentials reach the same rows.** An owner's bearer token, and a live
+*view* link **plus a reader session**. Most tests below are written twice for
+that reason, because "it works for the owner" has never implied "and it works
+for the family", and the family are the ones the product is for.
+
+**A link on its own opens nothing.** Since the door
+(`POST /r/{token}/open`, tested in `tests/security/test_reader_gate.py`) every
+link-addressed read carries a session too, which is why the reader here says
+who they are once, at the top, and never again.
 """
 
 import uuid
@@ -18,6 +23,7 @@ import uuid
 import pytest
 
 from tests.conftest import TOKEN_PATTERN, requires_db
+from tests.factories import TEST_PASSPHRASE
 
 pytestmark = [requires_db, pytest.mark.db]
 
@@ -96,6 +102,9 @@ def book(factory, owner):
     )
 
     view = factory.link(memoir_id, scope="view")
+    # Every memoir a reader can open has a passphrase. Without one the door
+    # opens for nobody, which is its own test in test_reader_gate.py.
+    factory.protect(memoir_id)
 
     return {
         "memoir_id": memoir_id,
@@ -114,7 +123,52 @@ def book(factory, owner):
 
 
 def _link(token: str) -> dict:
+    """The link alone. Enough to be told 404, and no longer enough to read."""
     return {"X-Link-Token": token}
+
+
+@pytest.fixture
+def reader(client, book):
+    """Somebody who has been through the door, as a set of headers.
+
+    Returns `(headers, session)`. Tests that care who is reading pass a name;
+    the rest take the default, because "a reader" is the common case and
+    spelling out a fictional niece in every test obscures what each one is
+    actually about.
+    """
+
+    def _open(
+        name: str = "Claire Donnelly",
+        relationship: str | None = "Niece",
+        participant_token: str | None = None,
+    ):
+        response = client.post(
+            f"/r/{book['view_token']}/open",
+            json={
+                "passphrase": TEST_PASSPHRASE,
+                "display_name": name,
+                "relationship": relationship,
+                "participant_token": participant_token,
+            },
+        )
+        assert response.status_code == 200, response.text
+        session = response.json()
+        return (
+            {
+                "X-Link-Token": book["view_token"],
+                "X-Reader-Token": session["reader_token"],
+            },
+            session,
+        )
+
+    return _open
+
+
+@pytest.fixture
+def open_headers(reader):
+    """The common case: any reader, at the door, once."""
+    headers, _ = reader()
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +176,10 @@ def _link(token: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_a_view_link_opens_the_book(client, book):
-    """The reader's entry point, with no credential but the token."""
-    response = client.get(f"/r/{book['view_token']}")
+def test_a_view_link_and_a_session_open_the_book(client, book, reader):
+    """The reader's entry point: the link says which memoir, the session who."""
+    headers, _ = reader()
+    response = client.get(f"/r/{book['view_token']}", headers=headers)
     assert response.status_code == 200
 
     reading = response.json()
@@ -150,7 +205,19 @@ def test_the_book_never_carries_the_owners_private_answer(factory, client):
     )
     view = factory.link(str(memoir["id"]), scope="view")
 
-    body = client.get(f"/r/{view['token']}").json()
+    factory.protect(str(memoir["id"]))
+    session = client.post(
+        f"/r/{view['token']}/open",
+        json={"passphrase": TEST_PASSPHRASE, "display_name": "A Reader"},
+    ).json()
+
+    body = client.get(
+        f"/r/{view['token']}",
+        headers={
+            "X-Link-Token": view["token"],
+            "X-Reader-Token": session["reader_token"],
+        },
+    ).json()
     assert "never_forget" not in body
     assert "floods" not in response_text(body)
 
@@ -164,7 +231,9 @@ def response_text(payload) -> str:
     return str(payload)
 
 
-def test_the_index_of_people_lists_only_those_who_gave_something(client, book, factory):
+def test_the_index_of_people_lists_only_those_who_gave_something(
+    client, book, factory, reader
+):
     """Somebody who opened the link and sent nothing is not in the book.
 
     They are a real row, and they belong on the owner's contributors screen.
@@ -173,7 +242,9 @@ def test_the_index_of_people_lists_only_those_who_gave_something(client, book, f
     """
     factory.contributor(book["memoir_id"], display_name="Never Replied")
 
-    people = client.get(f"/r/{book['view_token']}").json()["people"]
+    headers, _ = reader()
+    people = client.get(f"/r/{book['view_token']}", headers=headers)
+    people = people.json()["people"]
     names = [p["name"] for p in people]
 
     assert "Margaret Reyes" in names
@@ -219,14 +290,14 @@ def test_a_stranger_gets_404_for_somebody_elses_memoir(as_owner, book, stranger)
 # ---------------------------------------------------------------------------
 
 
-def test_a_chapter_comes_back_whole(client, storage, book):
+def test_a_chapter_comes_back_whole(client, storage, book, open_headers):
     """Prose, photograph and credits in one response.
 
     A chapter is one page. Four round trips to draw it is four chances to show
     half of one.
     """
     response = client.get(
-        f"/chapters/{book['chapter_id']}", headers=_link(book["view_token"])
+        f"/chapters/{book['chapter_id']}", headers=open_headers
     )
     assert response.status_code == 200
 
@@ -240,14 +311,14 @@ def test_a_chapter_comes_back_whole(client, storage, book):
     assert chapter["told_by"][0] == "Margaret Reyes", "most-cited first"
 
 
-def test_a_paragraph_carries_the_people_it_was_assembled_from(client, storage, book):
+def test_a_paragraph_carries_the_people_it_was_assembled_from(client, storage, book, open_headers):
     """The "never fabricate" rule, as a response body.
 
     Two accounts of one paragraph, one of them marked as differing, and the
     span of the words each supplied.
     """
     chapter = client.get(
-        f"/chapters/{book['chapter_id']}", headers=_link(book["view_token"])
+        f"/chapters/{book['chapter_id']}", headers=open_headers
     ).json()
     first = chapter["blocks"][0]
 
@@ -263,14 +334,14 @@ def test_a_paragraph_carries_the_people_it_was_assembled_from(client, storage, b
     assert whole["diverges"] is True, "the account that contradicts is kept and marked"
 
 
-def test_a_photograph_is_captioned_by_the_person_who_gave_it(client, storage, book):
+def test_a_photograph_is_captioned_by_the_person_who_gave_it(client, storage, book, open_headers):
     """Never by the machine.
 
     Inventing a description of somebody's photograph is exactly what the
     product forbids; the honest caption is already in the archive.
     """
     chapter = client.get(
-        f"/chapters/{book['chapter_id']}", headers=_link(book["view_token"])
+        f"/chapters/{book['chapter_id']}", headers=open_headers
     ).json()
     figure = [b for b in chapter["blocks"] if b["kind"] == "figure"][0]["figure"]
 
@@ -281,10 +352,10 @@ def test_a_photograph_is_captioned_by_the_person_who_gave_it(client, storage, bo
     assert figure["url"].startswith("https://storage.test/read/")
 
 
-def test_a_photographs_address_in_storage_never_leaves_the_api(client, storage, book):
+def test_a_photographs_address_in_storage_never_leaves_the_api(client, storage, book, open_headers):
     """`storage_path` is internal. Handing it out invites built URLs."""
     body = client.get(
-        f"/chapters/{book['chapter_id']}", headers=_link(book["view_token"])
+        f"/chapters/{book['chapter_id']}", headers=open_headers
     ).json()
     assert "storage_path" not in response_text(body)
 
@@ -294,14 +365,14 @@ def test_a_chapter_needs_some_credential(client, book):
     assert client.get(f"/chapters/{book['chapter_id']}").status_code == 401
 
 
-def test_a_chapter_from_another_memoir_is_not_reachable(factory, client, book):
+def test_a_chapter_from_another_memoir_is_not_reachable(factory, client, book, open_headers):
     """A live view link opens its own memoir and nothing else."""
     other_account = factory.account(name="Someone Else")
     other_memoir = factory.memoir(other_account["id"], subject_name="Another Subject")
     other_chapter = factory.chapter(str(other_memoir["id"]))
 
     response = client.get(
-        f"/chapters/{other_chapter['id']}", headers=_link(book["view_token"])
+        f"/chapters/{other_chapter['id']}", headers=open_headers
     )
     assert response.status_code == 404
 
@@ -311,40 +382,38 @@ def test_a_chapter_from_another_memoir_is_not_reachable(factory, client, book):
 # ---------------------------------------------------------------------------
 
 
-def test_a_reader_leaves_a_comment_and_is_remembered(client, book):
+def test_a_reader_comments_as_whoever_they_said_they_were(client, book, open_headers):
     """The receipt carries the token that makes them the same person next time.
 
-    The only response in this router that hands out a credential, and it goes
-    to somebody who by design has no other one.
+    Their name is on it without their having typed it here: it was taken at
+    the door, and the session on this request is what carries it.
     """
     response = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
             "body": "My mother told this one differently.",
-            "display_name": "Claire Donnelly",
         },
     )
     assert response.status_code == 201
 
     receipt = response.json()
-    assert TOKEN_PATTERN.match(receipt["participant_token"])
+    assert "participant_token" not in receipt, "the door issues that, not this"
     assert receipt["thread"]["block_id"] == book["first_block"]
     assert receipt["thread"]["comments"][0]["name"] == "Claire Donnelly"
     assert receipt["thread"]["comments"][0]["is_owner"] is False
 
 
-def test_a_comment_can_be_about_a_phrase_rather_than_a_paragraph(client, book):
+def test_a_comment_can_be_about_a_phrase_rather_than_a_paragraph(client, book, open_headers):
     response = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
             "start_offset": 41,
             "end_offset": 81,
             "body": "Damp, not the cold.",
-            "display_name": "Thomas Marsh",
         },
     )
     assert response.status_code == 201
@@ -353,7 +422,7 @@ def test_a_comment_can_be_about_a_phrase_rather_than_a_paragraph(client, book):
     assert (thread["start_offset"], thread["end_offset"]) == (41, 81)
 
 
-def test_a_comment_cannot_point_past_the_end_of_the_passage(client, book):
+def test_a_comment_cannot_point_past_the_end_of_the_passage(client, book, open_headers):
     """The database can only tell that end > start.
 
     An offset past the end would store fine and then highlight nothing forever,
@@ -361,49 +430,65 @@ def test_a_comment_cannot_point_past_the_end_of_the_passage(client, book):
     """
     response = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
             "start_offset": 5,
             "end_offset": 9000,
             "body": "Anchored to nothing.",
-            "display_name": "Thomas Marsh",
         },
     )
     assert response.status_code == 400
 
 
-def test_a_reader_must_say_who_they_are(client, book):
-    """An unattributed comment in this product is worse than no comment."""
+def test_a_comment_cannot_claim_to_be_from_somebody_else(client, book, open_headers):
+    """A name in the body is ignored, because the session is the only identity.
+
+    Before the door existed this field was how a reader said who they were, so
+    it is exactly the field somebody would try next. It is not read, and the
+    comment lands under the name given at the door.
+
+    (Being *required* to say who you are is now a rule about opening the
+    memoir, and lives in tests/security/test_reader_gate.py.)
+    """
     response = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
-        json={"block_id": book["first_block"], "body": "Anonymous."},
-    )
-    assert response.status_code == 400
-
-
-def test_a_returning_reader_is_the_same_person(client, book):
-    """Two comments, one name in the memoir — not two Claire Donnellys."""
-    first = client.post(
-        f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
-            "body": "One.",
-            "display_name": "Claire Donnelly",
+            "body": "Anonymous.",
+            "display_name": "Margaret Reyes",
         },
+    )
+    assert response.status_code == 201
+    assert response.json()["thread"]["comments"][0]["name"] == "Claire Donnelly"
+
+
+def test_a_returning_reader_is_the_same_person(client, book, reader):
+    """Two visits, one name in the memoir — not two Claire Donnellys.
+
+    The token comes back from the door now and goes to the door next time. It
+    is the same mechanism as before and it has moved one step earlier, which is
+    what lets somebody be recognised while *reading* rather than only once they
+    write something.
+    """
+    first_headers, session = reader(name="Claire Donnelly")
+    first = client.post(
+        f"/chapters/{book['chapter_id']}/comments",
+        headers=first_headers,
+        json={"block_id": book["first_block"], "body": "One."},
     ).json()
 
+    assert TOKEN_PATTERN.match(session["participant_token"])
+
+    # A month later, on the same phone.
+    second_headers, _ = reader(
+        name="Claire Donnelly", participant_token=session["participant_token"]
+    )
     second = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
-        json={
-            "block_id": book["second_block"],
-            "body": "Two.",
-            "display_name": "Claire Donnelly",
-            "participant_token": first["participant_token"],
-        },
+        headers=second_headers,
+        json={"block_id": book["second_block"], "body": "Two."},
     ).json()
 
     assert (
@@ -412,24 +497,22 @@ def test_a_returning_reader_is_the_same_person(client, book):
     )
 
 
-def test_a_reply_joins_the_conversation_it_answers(client, book):
+def test_a_reply_joins_the_conversation_it_answers(client, book, open_headers):
     started = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
             "body": "She played worse for a year.",
-            "display_name": "Claire Donnelly",
         },
     ).json()
 
     replied = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "thread_id": started["thread"]["id"],
             "body": "Both are true.",
-            "display_name": "Margaret Reyes",
         },
     )
     assert replied.status_code == 201
@@ -442,30 +525,29 @@ def test_a_reply_joins_the_conversation_it_answers(client, book):
     ], "oldest first"
 
 
-def test_a_comment_names_exactly_one_target(client, book):
+def test_a_comment_names_exactly_one_target(client, book, open_headers):
     """Both ids, or neither, is 422 at the edge rather than a server guess."""
     both = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
             "thread_id": str(uuid.uuid4()),
             "body": "Which?",
-            "display_name": "Thomas Marsh",
         },
     )
     assert both.status_code == 422
 
     neither = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={"body": "Which?", "display_name": "Thomas Marsh"},
     )
     assert neither.status_code == 422
 
 
-def test_the_owner_comments_as_themselves_and_gets_no_token(as_owner, book):
-    """They already have an account. A second, weaker credential is a liability."""
+def test_the_owner_comments_as_themselves(as_owner, book):
+    """They already have an account, and are never handed a weaker credential."""
     response = as_owner(book["owner_id"]).post(
         f"/chapters/{book['chapter_id']}/comments",
         json={"block_id": book["first_block"], "body": "Ask Margaret about this."},
@@ -473,46 +555,49 @@ def test_the_owner_comments_as_themselves_and_gets_no_token(as_owner, book):
     assert response.status_code == 201
 
     receipt = response.json()
-    assert receipt["participant_token"] is None
+    assert "participant_token" not in receipt
     assert receipt["thread"]["comments"][0]["is_owner"] is True
 
 
-def test_a_published_memoir_still_accepts_comments(client, factory, book):
+def test_a_published_memoir_still_accepts_comments(client, factory, book, reader):
     """The one write in this API that publication does not close.
 
     Every other write answers 409 once `status` flips. This is the layer the
     confirm screen makes people tick a box about: "the comment layer stays
     open… for as long as they want."
+
+    Sealed first and read afterwards, which is also the real order. A session
+    minted before publication would not survive it — sealing writes the
+    passphrase, and every session is signed with it.
     """
     factory.publish(book["memoir_id"])
+    headers, _ = reader()
 
     response = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=headers,
         json={
             "block_id": book["first_block"],
             "body": "Still here, years later.",
-            "display_name": "Claire Donnelly",
         },
     )
     assert response.status_code == 201
 
 
-def test_comments_can_be_read_back_on_their_own(client, book):
+def test_comments_can_be_read_back_on_their_own(client, book, open_headers):
     """The reader polls this rather than re-fetching a chapter's whole prose."""
     client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": book["first_block"],
             "body": "One.",
-            "display_name": "Claire Donnelly",
         },
     )
 
     response = client.get(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
     )
     assert response.status_code == 200
 
@@ -533,7 +618,6 @@ def test_a_comment_cannot_be_posted_through_a_contribute_link(client, book):
         json={
             "block_id": book["first_block"],
             "body": "Wrong door.",
-            "display_name": "Someone",
         },
     )
     assert response.status_code == 404
@@ -541,18 +625,17 @@ def test_a_comment_cannot_be_posted_through_a_contribute_link(client, book):
 
 def test_a_comment_cannot_be_anchored_to_another_chapters_block(
     factory, client, book
-):
+, open_headers):
     """A block id from elsewhere looks exactly like one that does not exist."""
     other = factory.chapter(book["memoir_id"], ordinal=1, title="A Second Chapter")
     elsewhere = factory.block(book["memoir_id"], str(other["id"]), text="Elsewhere.")
 
     response = client.post(
         f"/chapters/{book['chapter_id']}/comments",
-        headers=_link(book["view_token"]),
+        headers=open_headers,
         json={
             "block_id": str(elsewhere["id"]),
             "body": "Wrong chapter.",
-            "display_name": "Thomas Marsh",
         },
     )
     assert response.status_code == 404

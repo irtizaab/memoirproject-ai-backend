@@ -8,6 +8,12 @@
 #
 # `GET /r/{token}` is the exception with no bearer path at all — the read-side
 # twin of `GET /j/{token}`, and the entry point the reader is opened by.
+#
+# Every link-addressed route also wants `X-Reader-Token`: the session issued by
+# `POST /r/{token}/open` in exchange for the passphrase and a name. The link
+# says which memoir; the session says who is holding it. A link that has been
+# forwarded to somebody who was never told the passphrase opens nothing, and
+# there is no way to read a family's memoir without saying who you are.
 
 import logging
 from uuid import UUID
@@ -22,7 +28,6 @@ from src.domain.chapters.assembly_service import (
     assemble,
 )
 from src.domain.chapters.chapter_service import (
-    NameRequired,
     SpanOutOfRange,
     add_comment,
     get_chapter,
@@ -30,6 +35,7 @@ from src.domain.chapters.chapter_service import (
     reading_for_link,
     reading_for_owner,
 )
+from src.domain.chapters.reader_gate import ReaderNameRequired, open_for_reading
 from src.models.chapter_models import (
     AssemblyResult,
     Chapter,
@@ -37,6 +43,8 @@ from src.models.chapter_models import (
     CommentReceipt,
     CommentThread,
     MemoirReading,
+    ReaderOpen,
+    ReaderSession,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +55,19 @@ router = APIRouter(tags=["chapters"])
 # is the same question ("is there a usable bearer token on this request?") and
 # the same answer — None rather than a 401, because arriving without one is a
 # legitimate way to call these.
+
+
+READER_TOKEN = Header(
+    default=None,
+    alias="X-Reader-Token",
+    description="session from POST /r/{token}/open",
+)
+
+LINK_TOKEN = Header(
+    default=None,
+    alias="X-Link-Token",
+    description="view link token, for a reader with no account",
+)
 
 
 def _either(user_id: str | None, link_token: str | None) -> None:
@@ -69,8 +90,52 @@ def _either(user_id: str | None, link_token: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 
+@router.post("/r/{token}/open", response_model=ReaderSession)
+async def post_open(
+    token: str,
+    body: ReaderOpen,
+    user_id: str | None = Depends(optional_user_id),
+):
+    """The door. Exchange a passphrase and a name for a reader session.
+
+    Every way of failing answers 404: an unknown token, a revoked one, a
+    contribute link, a memoir nobody has protected yet, and the wrong
+    passphrase. Telling a real link with a bad passphrase apart from a link
+    that was never real is what turns a leaked link into a target worth
+    guessing at.
+
+    Not rate limited here, and it should be at the edge. scrypt makes each
+    attempt cost the server about as much as it costs the attacker, which
+    bounds the damage but does not remove it.
+
+    The owner is recognised by their bearer token and let straight through
+    without a passphrase or a name: they set the one and their account carries
+    the other.
+    """
+    try:
+        session = await open_for_reading(
+            token,
+            passphrase=body.passphrase,
+            display_name=body.display_name,
+            relationship=body.relationship,
+            participant_token=body.participant_token,
+            user_id=user_id,
+        )
+    except ReaderNameRequired:
+        # 400 and not 404: the link and the passphrase were right, and what is
+        # missing is something the person can fix in the form in front of them.
+        raise HTTPException(
+            status_code=400, detail="say who you are before opening the memoir"
+        )
+
+    if session is None:
+        raise HTTPException(status_code=404, detail="link not found")
+
+    return session
+
+
 @router.get("/r/{token}", response_model=MemoirReading)
-async def get_reading(token: str):
+async def get_reading(token: str, x_reader_token: str | None = READER_TOKEN):
     """Resolve a view link into the book it opens.
 
     `/r/` for read, beside `/j/` for join. Short for the same reason: this URL
@@ -86,9 +151,10 @@ async def get_reading(token: str):
     `never_forget` answer away from anyone the link was forwarded to — the same
     reasoning as `LinkInvitation` on `GET /j/{token}`.
     """
-    reading = await reading_for_link(token)
+    reading = await reading_for_link(token, x_reader_token)
 
-    # Unknown, revoked and wrong-scope look identical from out here, on purpose.
+    # Unknown, revoked, wrong-scope and no-session look identical from out
+    # here, on purpose.
     if reading is None:
         raise HTTPException(status_code=404, detail="link not found")
 
@@ -162,9 +228,8 @@ async def post_assemble(
 async def get_one_chapter(
     chapter_id: UUID,
     user_id: str | None = Depends(optional_user_id),
-    x_link_token: str | None = Header(
-        default=None, description="view link token, for a reader with no account"
-    ),
+    x_link_token: str | None = LINK_TOKEN,
+    x_reader_token: str | None = READER_TOKEN,
 ):
     """One chapter: its prose, its photographs, its sources, its conversation.
 
@@ -174,7 +239,10 @@ async def get_one_chapter(
     _either(user_id, x_link_token)
 
     chapter = await get_chapter(
-        str(chapter_id), user_id=user_id, link_token=x_link_token
+        str(chapter_id),
+        user_id=user_id,
+        link_token=x_link_token,
+        reader_token=x_reader_token,
     )
     if chapter is None:
         raise HTTPException(status_code=404, detail="chapter not found")
@@ -190,9 +258,8 @@ async def get_one_chapter(
 async def get_comments(
     chapter_id: UUID,
     user_id: str | None = Depends(optional_user_id),
-    x_link_token: str | None = Header(
-        default=None, description="view link token, for a reader with no account"
-    ),
+    x_link_token: str | None = LINK_TOKEN,
+    x_reader_token: str | None = READER_TOKEN,
 ):
     """Just the conversation.
 
@@ -204,7 +271,10 @@ async def get_comments(
     _either(user_id, x_link_token)
 
     threads = await list_threads(
-        str(chapter_id), user_id=user_id, link_token=x_link_token
+        str(chapter_id),
+        user_id=user_id,
+        link_token=x_link_token,
+        reader_token=x_reader_token,
     )
     if threads is None:
         raise HTTPException(status_code=404, detail="chapter not found")
@@ -218,9 +288,8 @@ async def post_comment(
     chapter_id: UUID,
     body: CommentCreate,
     user_id: str | None = Depends(optional_user_id),
-    x_link_token: str | None = Header(
-        default=None, description="view link token, for a reader with no account"
-    ),
+    x_link_token: str | None = LINK_TOKEN,
+    x_reader_token: str | None = READER_TOKEN,
 ):
     """Say something about a passage, or reply to somebody who did.
 
@@ -232,10 +301,13 @@ async def post_comment(
     Three failures worth telling apart:
 
       401  no credential at all
-      400  a reader who did not say who they are, or an offset past the end of
-           the paragraph — both the caller's mistake, both fixable
+      400  an offset past the end of the paragraph — the caller's mistake, and
+           fixable
       404  a chapter, block or thread this credential cannot reach, or that
            does not exist. Deliberately undistinguished.
+
+    Nobody is asked who they are here. That was settled at the door, and the
+    reader session on this request carries it.
     """
     _either(user_id, x_link_token)
 
@@ -245,10 +317,7 @@ async def post_comment(
             body.model_dump(),
             user_id=user_id,
             link_token=x_link_token,
-        )
-    except NameRequired:
-        raise HTTPException(
-            status_code=400, detail="say who this is from before leaving it"
+            reader_token=x_reader_token,
         )
     except SpanOutOfRange:
         raise HTTPException(

@@ -250,16 +250,10 @@ class CommentCreate(BaseModel):
     end_offset: int | None = Field(default=None, gt=0)
     thread_id: UUID | None = None
 
-    # Who this is from. Required for a caller holding a view link, ignored for
-    # the owner — they are already identified by their token, and their owner
-    # participant row already carries their name. The route enforces that
-    # difference; the model cannot see which credential arrived.
-    display_name: str | None = Field(default=None, min_length=1, max_length=120)
-
-    # Returned after the first comment and sent back on every later one, so a
-    # returning reader is recognised as the same person rather than appearing
-    # in the memoir twice. The same token a contributor already holds.
-    participant_token: str | None = None
+    # No name here, and none is accepted. Who this is from was settled at the
+    # door: the owner by their account, a reader by the session they were given
+    # in exchange for the passphrase and their name. A `display_name` on this
+    # model would be a second, weaker way to claim to be somebody.
 
     @model_validator(mode="after")
     def _one_target(self):
@@ -285,15 +279,14 @@ class CommentCreate(BaseModel):
 
 
 class CommentReceipt(BaseModel):
-    """What a reader gets back after commenting.
+    """What a reader gets back after commenting: the thread as it now stands.
 
-    The thread as it now stands, plus the token that makes them the same person
-    next time. `participant_token` is null for the owner, who has a real
-    account and must not be handed a second, weaker credential.
+    It used to carry a `participant_token` as well — the thing that made
+    somebody the same person next time. That is issued at the door now, by
+    `POST /r/{token}/open`, along with everything else about who they are.
     """
 
     thread: CommentThread
-    participant_token: str | None
 
 
 class AssemblyResult(BaseModel):
@@ -313,3 +306,48 @@ class AssemblyResult(BaseModel):
     blocks: int
     sources: int
     figures: int
+
+
+class ReaderOpen(BaseModel):
+    """Body of POST /r/{token}/open — the door to a published memoir.
+
+    Every field is optional here and the route decides which are required,
+    because two very different people knock at this door. The owner arrives
+    with a bearer token and needs none of it. Everybody else needs the
+    passphrase and a name.
+
+    `relationship` is free text — "Granddaughter", "Cousin David's wife" — and
+    not the `relationship_group` enum the onboarding flow collects. A reader is
+    describing themselves in a sentence, not choosing from a list, and it is
+    stored in `relationship_label` for exactly that reason.
+    """
+
+    passphrase: str | None = Field(default=None, max_length=256)
+    display_name: str | None = Field(default=None, max_length=120)
+    relationship: str | None = Field(default=None, max_length=120)
+
+    # Sent by a browser that has one from contributing months ago, so the
+    # person reading is recognised as the person who sent the memories rather
+    # than appearing in the memoir twice.
+    participant_token: str | None = None
+
+
+class ReaderSession(BaseModel):
+    """What the door gives back.
+
+    `reader_token` goes in `X-Reader-Token` on every request after this one. It
+    is a signature rather than a stored row (see `reader_gate.py`), and it stops
+    working the moment the passphrase is replaced or the link is revoked.
+
+    What is deliberately absent: anything about the memoir. This route proves a
+    credential; `GET /r/{token}` returns the book.
+    """
+
+    reader_token: str
+    display_name: str
+    is_owner: bool
+
+    # Null for the owner, whose participant row is forbidden from carrying one
+    # (migration 0003). For everybody else it is the same token the contribute
+    # side uses, so one browser is one person across both.
+    participant_token: str | None

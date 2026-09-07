@@ -155,18 +155,36 @@ Stored: text plus **paragraph** segments. Not word-level timings — that array 
 all speak English, and asking for English transcription of Urdu does not fail —
 it returns fluent, confident nonsense, which is worse.
 
-**The finished memoir** (migration `0011`)
-- `GET /r/{token}` — **public**, the read-side twin of `GET /j/{token}`. Resolves
-  a **view**-scoped `memoir_link` into the book's covers: subject, contents,
-  the index of people, and the colophon's four numbers. `response_model` keeps
-  `never_forget` out of it, for the same reason `LinkInvitation` does — a link
-  gets forwarded, and forwarding it would forward the owner's private answer.
+**The finished memoir** (migrations `0011`, `0012`)
+- `POST /r/{token}/open` — **the door**. Takes the passphrase and a name,
+  returns a reader session. Everything that fails answers 404: unknown token,
+  revoked, wrong scope, no passphrase set, wrong passphrase. Telling a real
+  link with a bad passphrase apart from a link that was never real is what
+  turns a leaked link into a target. The owner is recognised by their bearer
+  token and let through without either — they set the passphrase and their
+  account carries their name.
+- `GET /r/{token}` — resolves a **view**-scoped `memoir_link` into the book's
+  covers: subject, contents, the index of people, the colophon's four numbers.
+  Needs `X-Reader-Token` as well as the link; the link says which memoir, the
+  session says who is holding it. `response_model` keeps `never_forget` out of
+  it, for the same reason `LinkInvitation` does.
 - `GET /memoirs/{id}/chapters` — the same covers for the owner (auth), so they
   can read before publishing and without a view link existing.
 - `GET /chapters/{id}`, `GET`/`POST /chapters/{id}/comments` — **either**
-  credential, the posture `media.py` already takes: an owner's bearer token or
-  `X-Link-Token`. A second parallel public router was the alternative, and that
-  is how two paths meant to return the same thing drift.
+  credential, the posture `media.py` already takes: an owner's bearer token, or
+  `X-Link-Token` **and** `X-Reader-Token`. A second parallel public router was
+  the alternative, and that is how two paths meant to return the same thing
+  drift.
+- **Nobody reads anonymously, and nobody signs a comment twice.** Identity is
+  taken once, at the door, and `CommentCreate` carries no name at all. Before
+  that, a person could read the whole book as nobody and be asked who they were
+  only if they had something to say.
+- **The session is a signature, not a row** (`domain/chapters/reader_gate.py`):
+  `{participant_id}.{hmac}`, keyed on the live link token and the passphrase
+  hash. So replacing the passphrase or revoking the link closes every session
+  that was ever issued, with nothing to sweep. It also sidesteps the CHECK in
+  `0003` that forbids an owner from holding a `contributor_token` — the owner
+  has to be able to read their own memoir.
 - **Scope is load-bearing.** `readable_memoir()` requires `scope = 'view'`, next
   to `contributable_memoir()`'s `scope = 'contribute'`. A link posted in a
   family group chat so people can send memories must not also hand out the
@@ -256,8 +274,10 @@ src/
     contributors.py                  contributors list, link reissue (auth)
     billing.py                       GET  /plans                  (public)
                                      GET  /billing, PATCH /billing/plan (auth)
-    chapters.py                      GET  /r/{token}              (public)
+    chapters.py                      POST /r/{token}/open         (the door)
+                                     GET  /r/{token}    (link + reader session)
                                      GET  /memoirs/{id}/chapters  (auth)
+                                     POST /memoirs/{id}/assemble  (auth)
                                      chapters + comments (either credential)
     webhooks.py                      POST /webhooks/assemblyai    (secret header)
     dev.py                           POST /dev/signin             (gated)
