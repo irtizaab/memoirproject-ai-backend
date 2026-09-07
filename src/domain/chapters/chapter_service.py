@@ -56,7 +56,7 @@ class SpanOutOfRange(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _reachable_chapter(
+async def _reachable_chapter(
     cur, chapter_id: str, user_id: str | None, link_token: str | None
 ) -> dict | None:
     """The chapter, if this caller may read it. None otherwise.
@@ -69,7 +69,7 @@ def _reachable_chapter(
     else's memoir matches nothing rather than matching on the id alone.
     """
     if user_id is not None:
-        cur.execute(
+        await cur.execute(
             """
             SELECT c.id, c.memoir_id, c.ordinal, c.title,
                    c.from_year, c.through_year
@@ -80,12 +80,12 @@ def _reachable_chapter(
             """,
             {"chapter": chapter_id, "user": user_id},
         )
-        row = cur.fetchone()
+        row = await cur.fetchone()
         if row is not None:
             return row
 
     if link_token is not None:
-        cur.execute(
+        await cur.execute(
             """
             SELECT c.id, c.memoir_id, c.ordinal, c.title,
                    c.from_year, c.through_year
@@ -98,7 +98,7 @@ def _reachable_chapter(
             """,
             {"chapter": chapter_id, "token": link_token},
         )
-        row = cur.fetchone()
+        row = await cur.fetchone()
         if row is not None:
             return row
 
@@ -110,8 +110,8 @@ def _reachable_chapter(
 # ---------------------------------------------------------------------------
 
 
-def _chapter_summaries(cur, memoir_id: str) -> list[dict]:
-    cur.execute(
+async def _chapter_summaries(cur, memoir_id: str) -> list[dict]:
+    await cur.execute(
         """
         SELECT id, ordinal, title, from_year, through_year
           FROM chapter
@@ -120,10 +120,10 @@ def _chapter_summaries(cur, memoir_id: str) -> list[dict]:
         """,
         {"memoir": memoir_id},
     )
-    return cur.fetchall()
+    return await cur.fetchall()
 
 
-def _people(cur, memoir_id: str) -> list[dict]:
+async def _people(cur, memoir_id: str) -> list[dict]:
     """Everyone who left something, most first.
 
     Only participants who actually contributed. Somebody who opened the link
@@ -135,7 +135,7 @@ def _people(cur, memoir_id: str) -> list[dict]:
     `merged_into IS NULL` skips the losing half of a merge, whose memories the
     query already counts under the winner.
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT p.id AS participant_id,
                p.display_name AS name,
@@ -153,10 +153,10 @@ def _people(cur, memoir_id: str) -> list[dict]:
         """,
         {"memoir": memoir_id},
     )
-    return cur.fetchall()
+    return await cur.fetchall()
 
 
-def _totals(cur, memoir_id: str) -> dict:
+async def _totals(cur, memoir_id: str) -> dict:
     """The colophon's four numbers.
 
     `people` counts those who contributed, not everyone invited, so it agrees
@@ -164,7 +164,7 @@ def _totals(cur, memoir_id: str) -> dict:
     called "people" and disagree is the kind of thing a family notices and
     never trusts again.
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT
           (SELECT COUNT(*) FROM memory
@@ -180,10 +180,10 @@ def _totals(cur, memoir_id: str) -> dict:
         """,
         {"memoir": memoir_id},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def _reading(cur, memoir: dict) -> dict:
+async def _reading(cur, memoir: dict) -> dict:
     """Assemble the covers from a memoir row that has already been authorized."""
     memoir_id = str(memoir["id"])
     return {
@@ -193,23 +193,23 @@ def _reading(cur, memoir: dict) -> dict:
         "through_year": memoir["through_year"],
         "subject_is_living": memoir["subject_is_living"],
         "published_at": memoir["published_at"],
-        "chapters": _chapter_summaries(cur, memoir_id),
-        "people": _people(cur, memoir_id),
-        "totals": _totals(cur, memoir_id),
+        "chapters": await _chapter_summaries(cur, memoir_id),
+        "people": await _people(cur, memoir_id),
+        "totals": await _totals(cur, memoir_id),
     }
 
 
-def reading_for_owner(memoir_id: str, user_id: str) -> dict | None:
+async def reading_for_owner(memoir_id: str, user_id: str) -> dict | None:
     """The covers, for the owner reading their own memoir. None if not theirs."""
-    with db() as conn, conn.cursor() as cur:
-        owned = owned_memoir(cur, memoir_id, user_id)
+    async with db() as conn, conn.cursor() as cur:
+        owned = await owned_memoir(cur, memoir_id, user_id)
         if owned is None:
             return None
 
         # `owned_memoir` returns only what a write path needs. The covers need
         # the dates and the publication state too, so read the row properly
         # rather than widening a helper six other callers depend on.
-        cur.execute(
+        await cur.execute(
             """
             SELECT id, subject_name, born_year, through_year,
                    subject_is_living, published_at
@@ -218,16 +218,16 @@ def reading_for_owner(memoir_id: str, user_id: str) -> dict | None:
             """,
             {"memoir": memoir_id},
         )
-        return _reading(cur, cur.fetchone())
+        return await _reading(cur, await cur.fetchone())
 
 
-def reading_for_link(link_token: str) -> dict | None:
+async def reading_for_link(link_token: str) -> dict | None:
     """The covers, for anybody holding a live view link. None if it is dead."""
-    with db() as conn, conn.cursor() as cur:
-        memoir = readable_memoir(cur, link_token)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await readable_memoir(cur, link_token)
         if memoir is None:
             return None
-        return _reading(cur, memoir)
+        return await _reading(cur, memoir)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +235,7 @@ def reading_for_link(link_token: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _figures(cur, memoir_id: str, blocks: list[dict]) -> dict:
+async def _figures(cur, memoir_id: str, blocks: list[dict]) -> dict:
     """`{asset_id: figure}` for every figure block, with signed URLs.
 
     Two round trips regardless of how many photographs a chapter holds: one
@@ -251,7 +251,7 @@ def _figures(cur, memoir_id: str, blocks: list[dict]) -> dict:
     if not asset_ids:
         return {}
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT a.id AS asset_id,
                a.storage_path,
@@ -273,9 +273,9 @@ def _figures(cur, memoir_id: str, blocks: list[dict]) -> dict:
         """,
         {"memoir": memoir_id, "ids": asset_ids},
     )
-    rows = cur.fetchall()
+    rows = await cur.fetchall()
 
-    signed = create_signed_download_urls([r["storage_path"] for r in rows])
+    signed = await create_signed_download_urls([r["storage_path"] for r in rows])
 
     figures = {}
     for row in rows:
@@ -295,7 +295,7 @@ def _figures(cur, memoir_id: str, blocks: list[dict]) -> dict:
     return figures
 
 
-def _sources(cur, memoir_id: str, block_ids: list[str]) -> dict:
+async def _sources(cur, memoir_id: str, block_ids: list[str]) -> dict:
     """`{block_id: [source, ...]}` for a whole chapter, in one query.
 
     `duration_ms` is the longest recording on the memory, so a voice credit can
@@ -309,7 +309,7 @@ def _sources(cur, memoir_id: str, block_ids: list[str]) -> dict:
     if not block_ids:
         return {}
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT s.id,
                s.block_id,
@@ -343,14 +343,14 @@ def _sources(cur, memoir_id: str, block_ids: list[str]) -> dict:
     )
 
     by_block: dict = {}
-    for row in cur.fetchall():
+    for row in await cur.fetchall():
         by_block.setdefault(row.pop("block_id"), []).append(row)
     return by_block
 
 
-def _threads(cur, chapter_id: str) -> list[dict]:
+async def _threads(cur, chapter_id: str) -> list[dict]:
     """Every conversation in the chapter, each with its comments oldest first."""
-    cur.execute(
+    await cur.execute(
         """
         SELECT id, chapter_id, block_id, start_offset, end_offset, resolved_at
           FROM comment_thread
@@ -359,11 +359,11 @@ def _threads(cur, chapter_id: str) -> list[dict]:
         """,
         {"chapter": chapter_id},
     )
-    threads = cur.fetchall()
+    threads = await cur.fetchall()
     if not threads:
         return []
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT c.id,
                c.thread_id,
@@ -383,7 +383,7 @@ def _threads(cur, chapter_id: str) -> list[dict]:
     )
 
     by_thread: dict = {}
-    for row in cur.fetchall():
+    for row in await cur.fetchall():
         by_thread.setdefault(row.pop("thread_id"), []).append(row)
 
     for thread in threads:
@@ -412,18 +412,18 @@ def _told_by(sources_by_block: dict) -> tuple[list[str], int]:
     return [name for name, _ in ordered], len(memories)
 
 
-def get_chapter(
+async def get_chapter(
     chapter_id: str, *, user_id: str | None = None, link_token: str | None = None
 ) -> dict | None:
     """One chapter, with its photographs, its sources and its conversation."""
-    with db() as conn, conn.cursor() as cur:
-        chapter = _reachable_chapter(cur, chapter_id, user_id, link_token)
+    async with db() as conn, conn.cursor() as cur:
+        chapter = await _reachable_chapter(cur, chapter_id, user_id, link_token)
         if chapter is None:
             return None
 
         memoir_id = str(chapter["memoir_id"])
 
-        cur.execute(
+        await cur.execute(
             """
             SELECT id, ordinal, kind::text AS kind, text,
                    asset_id, placement::text AS placement, anchor_block_id
@@ -434,10 +434,10 @@ def get_chapter(
             """,
             {"memoir": memoir_id, "chapter": chapter_id},
         )
-        rows = cur.fetchall()
+        rows = await cur.fetchall()
 
-        figures = _figures(cur, memoir_id, rows)
-        sources = _sources(cur, memoir_id, [r["id"] for r in rows])
+        figures = await _figures(cur, memoir_id, rows)
+        sources = await _sources(cur, memoir_id, [r["id"] for r in rows])
 
         blocks = []
         for row in rows:
@@ -470,13 +470,13 @@ def get_chapter(
         return {
             **chapter,
             "blocks": blocks,
-            "threads": _threads(cur, chapter_id),
+            "threads": await _threads(cur, chapter_id),
             "told_by": told_by,
             "memory_count": memory_count,
         }
 
 
-def list_threads(
+async def list_threads(
     chapter_id: str, *, user_id: str | None = None, link_token: str | None = None
 ) -> list[dict] | None:
     """Just the conversation.
@@ -486,10 +486,10 @@ def list_threads(
     this rather than re-fetching a chapter's whole prose and re-signing every
     photograph to find out.
     """
-    with db() as conn, conn.cursor() as cur:
-        if _reachable_chapter(cur, chapter_id, user_id, link_token) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await _reachable_chapter(cur, chapter_id, user_id, link_token) is None:
             return None
-        return _threads(cur, chapter_id)
+        return await _threads(cur, chapter_id)
 
 
 # ---------------------------------------------------------------------------
@@ -497,19 +497,19 @@ def list_threads(
 # ---------------------------------------------------------------------------
 
 
-def _owner_participant(cur, memoir_id: str) -> dict:
-    cur.execute(
+async def _owner_participant(cur, memoir_id: str) -> dict:
+    await cur.execute(
         """
         SELECT id FROM memoir_participant
          WHERE memoir_id = %(memoir)s AND role = 'owner'
         """,
         {"memoir": memoir_id},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def _one_thread(cur, thread_id: str) -> dict | None:
-    cur.execute(
+async def _one_thread(cur, thread_id: str) -> dict | None:
+    await cur.execute(
         """
         SELECT id, chapter_id, block_id, start_offset, end_offset, resolved_at
           FROM comment_thread
@@ -517,11 +517,11 @@ def _one_thread(cur, thread_id: str) -> dict | None:
         """,
         {"thread": thread_id},
     )
-    thread = cur.fetchone()
+    thread = await cur.fetchone()
     if thread is None:
         return None
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT c.id, c.participant_id, c.body, c.created_at,
                p.display_name       AS name,
@@ -535,11 +535,11 @@ def _one_thread(cur, thread_id: str) -> dict | None:
         """,
         {"thread": thread_id},
     )
-    thread["comments"] = cur.fetchall()
+    thread["comments"] = await cur.fetchall()
     return thread
 
 
-def add_comment(
+async def add_comment(
     chapter_id: str,
     payload: dict,
     *,
@@ -561,8 +561,8 @@ def add_comment(
     open… for as long as they want". Commenting before publication is allowed
     too, so an owner can send a view link to one person and hear back.
     """
-    with db() as conn, conn.cursor() as cur:
-        chapter = _reachable_chapter(cur, chapter_id, user_id, link_token)
+    async with db() as conn, conn.cursor() as cur:
+        chapter = await _reachable_chapter(cur, chapter_id, user_id, link_token)
         if chapter is None:
             return None
 
@@ -570,13 +570,13 @@ def add_comment(
 
         # --- who is talking ------------------------------------------------
         if user_id is not None:
-            participant = _owner_participant(cur, memoir_id)
+            participant = await _owner_participant(cur, memoir_id)
             participant_token = None
         else:
             display_name = (payload.get("display_name") or "").strip()
             if not display_name:
                 raise NameRequired
-            participant = resolve_participant(
+            participant = await resolve_participant(
                 cur,
                 memoir_id=memoir_id,
                 token=payload.get("participant_token"),
@@ -587,24 +587,24 @@ def add_comment(
         # --- which conversation --------------------------------------------
         thread_id = payload.get("thread_id")
         if thread_id is not None:
-            cur.execute(
+            await cur.execute(
                 """
                 SELECT id FROM comment_thread
                  WHERE id = %(thread)s AND chapter_id = %(chapter)s
                 """,
                 {"thread": str(thread_id), "chapter": chapter_id},
             )
-            if cur.fetchone() is None:
+            if await cur.fetchone() is None:
                 # A thread id from another chapter looks exactly like one that
                 # does not exist, same as everywhere else in this API.
                 return None
             thread_id = str(thread_id)
         else:
-            thread_id = _open_thread(cur, chapter_id, memoir_id, payload)
+            thread_id = await _open_thread(cur, chapter_id, memoir_id, payload)
             if thread_id is None:
                 return None
 
-        cur.execute(
+        await cur.execute(
             """
             INSERT INTO comment (memoir_id, thread_id, participant_id, body)
             VALUES (%(memoir)s, %(thread)s, %(participant)s, %(body)s)
@@ -618,12 +618,12 @@ def add_comment(
         )
 
         return {
-            "thread": _one_thread(cur, thread_id),
+            "thread": await _one_thread(cur, thread_id),
             "participant_token": participant_token,
         }
 
 
-def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | None:
+async def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | None:
     """Start a conversation about a block, or a range of characters inside it.
 
     The block is re-read here rather than trusted from the request, for two
@@ -631,7 +631,7 @@ def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | N
     through this one, and the offsets have to be checked against the real
     length of the real text. The database can only tell that `end > start`.
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT id, char_length(coalesce(text, '')) AS length
           FROM chapter_block
@@ -641,7 +641,7 @@ def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | N
         """,
         {"block": str(payload["block_id"]), "chapter": chapter_id, "memoir": memoir_id},
     )
-    block = cur.fetchone()
+    block = await cur.fetchone()
     if block is None:
         return None
 
@@ -650,7 +650,7 @@ def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | N
     if end is not None and end > block["length"]:
         raise SpanOutOfRange
 
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO comment_thread
             (memoir_id, chapter_id, block_id, start_offset, end_offset)
@@ -665,4 +665,4 @@ def _open_thread(cur, chapter_id: str, memoir_id: str, payload: dict) -> str | N
             "end": end,
         },
     )
-    return str(cur.fetchone()["id"])
+    return str((await cur.fetchone())["id"])

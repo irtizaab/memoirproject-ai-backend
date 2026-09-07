@@ -37,6 +37,7 @@ import logging
 import httpx
 
 from src.core.config import settings
+from src.integrations.http import client
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ def _headers() -> dict[str, str]:
     return {"Authorization": settings.assemblyai_api_key}
 
 
-def submit(audio_url: str) -> dict:
+async def submit(audio_url: str) -> dict:
     """Start a transcription job. Returns `{"id": ..., "status": ...}`.
 
     Asynchronous by nature: the reply arrives immediately with a job id and
@@ -108,7 +109,7 @@ def submit(audio_url: str) -> dict:
         payload["webhook_auth_header_value"] = settings.assemblyai_webhook_secret
 
     try:
-        response = httpx.post(
+        response = await (await client()).post(
             f"{_BASE_URL}/transcript",
             headers=_headers(),
             json=payload,
@@ -137,7 +138,7 @@ def submit(audio_url: str) -> dict:
     return body
 
 
-def fetch(provider_id: str) -> dict:
+async def fetch(provider_id: str) -> dict:
     """Ask what a job has produced, if anything yet.
 
     The poll half of the two ways a result arrives. Returns the job as-is,
@@ -145,7 +146,7 @@ def fetch(provider_id: str) -> dict:
     opinion about whether "processing" is interesting.
     """
     try:
-        response = httpx.get(
+        response = await (await client()).get(
             f"{_BASE_URL}/transcript/{provider_id}",
             headers=_headers(),
             timeout=20.0,
@@ -162,7 +163,7 @@ def fetch(provider_id: str) -> dict:
     return response.json()
 
 
-def paragraphs(provider_id: str) -> list[dict]:
+async def paragraphs(provider_id: str) -> list[dict]:
     """The transcript split into paragraphs, each with a start and end.
 
     A separate endpoint from the transcript itself, and a separate call. Worth
@@ -174,7 +175,7 @@ def paragraphs(provider_id: str) -> list[dict]:
     falls back to the plain text.
     """
     try:
-        response = httpx.get(
+        response = await (await client()).get(
             f"{_BASE_URL}/transcript/{provider_id}/paragraphs",
             headers=_headers(),
             timeout=20.0,

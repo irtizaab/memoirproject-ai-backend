@@ -14,7 +14,7 @@ router = APIRouter(tags=["account"])
 
 
 @router.get("/me", response_model=AccountOverview)
-def get_me(user: CurrentUser = Depends(current_user)):
+async def get_me(user: CurrentUser = Depends(current_user)):
     """Who am I, and what do I own.
 
     The frontend calls this on load to decide what to show: no memoirs means
@@ -36,5 +36,5 @@ def get_me(user: CurrentUser = Depends(current_user)):
         "id": user.id,
         "email": user.email,
         "full_name": user.full_name,
-        "memoirs": list_memoirs_for_owner(user.id),
+        "memoirs": await list_memoirs_for_owner(user.id),
     }

@@ -34,7 +34,7 @@ class AlreadyHasMemoir(Exception):
     """
 
 
-def claim_draft(
+async def claim_draft(
     draft_id: str,
     draft_token: str,
     user_id: str,
@@ -97,8 +97,8 @@ def claim_draft(
         "full_name": full_name or "",
     }
 
-    with db() as conn:
-        with conn.cursor() as cur:
+    async with db() as conn:
+        async with conn.cursor() as cur:
             # 1. Make sure the account row exists.
             #
             # memoir.created_by_user_id has a foreign key to user_account(id),
@@ -109,7 +109,7 @@ def claim_draft(
             # ON CONFLICT DO NOTHING makes this safe to run on every claim: the
             # second memoir a person creates finds their account already there
             # and moves on, instead of failing on the primary key.
-            cur.execute(
+            await cur.execute(
                 """
                 INSERT INTO user_account (id, email, full_name)
                 VALUES (%(user_id)s, %(email)s, %(full_name)s)
@@ -124,7 +124,7 @@ def claim_draft(
             # a generic 409 leaves the frontend nothing useful to say. Failing
             # here means the draft is left unclaimed and the caller can be told
             # to go to the archive they already have.
-            cur.execute(
+            await cur.execute(
                 """
                 SELECT id FROM memoir
                  WHERE created_by_user_id = %(user_id)s
@@ -132,11 +132,11 @@ def claim_draft(
                 """,
                 {"user_id": user_id},
             )
-            if cur.fetchone() is not None:
+            if await cur.fetchone() is not None:
                 raise AlreadyHasMemoir
 
             # 2. Claim the draft and read its answers in one atomic step.
-            cur.execute(
+            await cur.execute(
                 """
                 UPDATE memoir_draft
                    SET claimed_at = now()
@@ -150,7 +150,7 @@ def claim_draft(
                 """,
                 params,
             )
-            draft = cur.fetchone()
+            draft = await cur.fetchone()
 
             # None covers "no such draft", "wrong token" and "already claimed"
             # alike, and the caller is told the same thing for all three.
@@ -172,7 +172,7 @@ def claim_draft(
                 raise DraftIncomplete("draft has no subject name")
 
             # 4. The memoir itself.
-            cur.execute(
+            await cur.execute(
                 """
                 INSERT INTO memoir (subject_name, born_year, through_year,
                                     subject_is_living, never_forget,
@@ -192,7 +192,7 @@ def claim_draft(
                     "user_id": user_id,
                 },
             )
-            memoir = cur.fetchone()
+            memoir = await cur.fetchone()
 
             # 5. The owner's participant row.
             #
@@ -215,7 +215,7 @@ def claim_draft(
                 or (email.split("@")[0] if email else "")
                 or "Owner"
             )
-            cur.execute(
+            await cur.execute(
                 """
                 INSERT INTO memoir_participant (memoir_id, role, user_id,
                                                 display_name, relationship,
@@ -239,7 +239,7 @@ def claim_draft(
             # scope 'contribute' is the one the dashboard shows. A partial
             # unique index allows only one live link per scope per memoir,
             # which is what keeps the promise of "one link".
-            cur.execute(
+            await cur.execute(
                 """
                 INSERT INTO memoir_link (memoir_id, scope)
                 VALUES (%(memoir_id)s, 'contribute')
@@ -247,14 +247,14 @@ def claim_draft(
                 """,
                 {"memoir_id": memoir["id"]},
             )
-            link = cur.fetchone()
+            link = await cur.fetchone()
 
     # Reached only if the block above committed.
     logger.info("Claimed draft %s into memoir %s", draft_id, memoir["id"])
     return {**memoir, "link_token": link["token"]}
 
 
-def list_memoirs_for_owner(user_id: str) -> list[dict]:
+async def list_memoirs_for_owner(user_id: str) -> list[dict]:
     """Every memoir this account created, newest first.
 
     LEFT JOIN, not JOIN: a memoir whose link has been revoked still belongs on
@@ -264,8 +264,8 @@ def list_memoirs_for_owner(user_id: str) -> list[dict]:
     The join is filtered to live contribute links only - `revoked_at IS NULL` -
     so a dead token is never handed back to be shared.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT m.id, m.subject_name, m.born_year, m.through_year,
                    m.subject_is_living, m.never_forget,
@@ -281,4 +281,4 @@ def list_memoirs_for_owner(user_id: str) -> list[dict]:
             """,
             {"user_id": user_id},
         )
-        return cur.fetchall()
+        return await cur.fetchall()

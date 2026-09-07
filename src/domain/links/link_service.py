@@ -13,7 +13,7 @@ from src.integrations.db import db
 logger = logging.getLogger(__name__)
 
 
-def resolve_link(token: str) -> dict | None:
+async def resolve_link(token: str) -> dict | None:
     """Look up the memoir a share token points at, and count the open.
 
     Returns just enough for the invitation screen, or None if the token is
@@ -40,8 +40,8 @@ def resolve_link(token: str) -> dict | None:
     work: a killed token matches no row, so nothing is returned and the counter
     does not move.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             WITH opened AS (
                 UPDATE memoir_link
@@ -66,7 +66,7 @@ def resolve_link(token: str) -> dict | None:
             """,
             {"token": token},
         )
-        row = cur.fetchone()
+        row = await cur.fetchone()
 
     if row is None:
         # Deliberately info, not warning. A stale link being opened is an

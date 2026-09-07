@@ -82,7 +82,7 @@ async def post_assemblyai(
     if status not in ("completed", "error"):
         return {"received": True}
 
-    applied = apply_result(provider_id, payload)
+    applied = await apply_result(provider_id, payload)
     if not applied:
         # Genuine callback, no row. Deleted mid-flight, or a job from another
         # environment pointed at this URL. Neither is worth a retry.

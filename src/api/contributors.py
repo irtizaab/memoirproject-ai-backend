@@ -28,14 +28,14 @@ router = APIRouter(prefix="/memoirs", tags=["contributors"])
 
 
 @router.get("/{memoir_id}/contributors", response_model=ContributorsOverview)
-def get_contributors(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+async def get_contributors(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
     """Everyone in the memoir, plus the live share link.
 
     One response rather than two endpoints, because the screen shows them
     together and splitting it would only make the page assemble itself in
     front of the reader.
     """
-    overview = list_contributors(str(memoir_id), user.id)
+    overview = await list_contributors(str(memoir_id), user.id)
     if overview is None:
         raise HTTPException(status_code=404, detail="memoir not found")
     return overview
@@ -45,7 +45,7 @@ def get_contributors(memoir_id: UUID, user: CurrentUser = Depends(current_user))
     "/{memoir_id}/contributors/{loser_id}/merge-into/{winner_id}",
     response_model=MergeResult,
 )
-def post_merge_contributors(
+async def post_merge_contributors(
     memoir_id: UUID,
     loser_id: UUID,
     winner_id: UUID,
@@ -68,7 +68,7 @@ def post_merge_contributors(
     Not reversible. The frontend says so before calling it.
     """
     try:
-        result = merge_participants(
+        result = await merge_participants(
             str(memoir_id), user.id, str(loser_id), str(winner_id)
         )
     except CannotMerge as exc:
@@ -80,7 +80,7 @@ def post_merge_contributors(
 
 
 @router.post("/{memoir_id}/link/reissue", response_model=ShareLink, status_code=201)
-def post_reissue_link(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+async def post_reissue_link(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
     """Kill the current share link and issue a new one.
 
     Destructive, and the frontend must say so before calling it: everybody
@@ -91,7 +91,7 @@ def post_reissue_link(memoir_id: UUID, user: CurrentUser = Depends(current_user)
     Nothing already contributed is affected. Revoking a link closes the door;
     it does not empty the room.
     """
-    link = reissue_link(str(memoir_id), user.id)
+    link = await reissue_link(str(memoir_id), user.id)
     if link is None:
         raise HTTPException(status_code=404, detail="memoir not found")
     return link

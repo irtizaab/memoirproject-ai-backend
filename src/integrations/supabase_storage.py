@@ -23,6 +23,7 @@ import logging
 import httpx
 
 from src.core.config import settings
+from src.integrations.http import client
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {key}", "apikey": key}
 
 
-def create_signed_upload_url(path: str) -> str:
+async def create_signed_upload_url(path: str) -> str:
     """Mint a one-shot URL the browser can PUT a file to.
 
     Returns an absolute URL. The token inside it is scoped to this exact path,
@@ -68,7 +69,9 @@ def create_signed_upload_url(path: str) -> str:
     url = f"{settings.supabase_storage_url}/object/upload/sign/{bucket}/{path}"
 
     try:
-        response = httpx.post(url, headers=_headers(), timeout=15.0)
+        response = await (await client()).post(
+            url, headers=_headers(), timeout=15.0
+        )
     except httpx.HTTPError as exc:
         raise StorageError(f"could not reach storage: {exc}") from exc
 
@@ -85,7 +88,7 @@ def create_signed_upload_url(path: str) -> str:
     return f"{settings.supabase_storage_url}{signed}"
 
 
-def create_signed_download_url(path: str) -> str:
+async def create_signed_download_url(path: str) -> str:
     """Mint a temporary read URL for a private object.
 
     The bucket is private, so an object has no public address. This is how a
@@ -99,7 +102,7 @@ def create_signed_download_url(path: str) -> str:
     url = f"{settings.supabase_storage_url}/object/sign/{bucket}/{path}"
 
     try:
-        response = httpx.post(
+        response = await (await client()).post(
             url,
             headers=_headers(),
             json={"expiresIn": settings.signed_url_ttl_seconds},
@@ -121,7 +124,7 @@ def create_signed_download_url(path: str) -> str:
     return f"{settings.supabase_storage_url}{signed}"
 
 
-def create_signed_download_urls(paths: list[str]) -> dict[str, str]:
+async def create_signed_download_urls(paths: list[str]) -> dict[str, str]:
     """Sign many objects at once, returning `{path: url}`.
 
     The archive shows a dozen memories at a time, each with a photograph or a
@@ -140,7 +143,7 @@ def create_signed_download_urls(paths: list[str]) -> dict[str, str]:
     url = f"{settings.supabase_storage_url}/object/sign/{bucket}"
 
     try:
-        response = httpx.post(
+        response = await (await client()).post(
             url,
             headers=_headers(),
             json={"expiresIn": settings.signed_url_ttl_seconds, "paths": paths},
@@ -168,7 +171,7 @@ def create_signed_download_urls(paths: list[str]) -> dict[str, str]:
     return signed
 
 
-def object_size(path: str) -> int:
+async def object_size(path: str) -> int:
     """How many bytes storage is actually holding at `path`.
 
     Asked rather than accepted. The client knows the size of the file it sent
@@ -184,7 +187,9 @@ def object_size(path: str) -> int:
     url = f"{settings.supabase_storage_url}/object/{bucket}/{path}"
 
     try:
-        response = httpx.head(url, headers=_headers(), timeout=15.0)
+        response = await (await client()).head(
+            url, headers=_headers(), timeout=15.0
+        )
     except httpx.HTTPError as exc:
         raise StorageError(f"could not reach storage: {exc}") from exc
 
@@ -198,7 +203,7 @@ def object_size(path: str) -> int:
     return int(length)
 
 
-def delete_object(path: str) -> None:
+async def delete_object(path: str) -> None:
     """Remove an object. Used when its memory is deleted.
 
     A failure here is logged and swallowed rather than raised. The caller has
@@ -212,7 +217,9 @@ def delete_object(path: str) -> None:
     url = f"{settings.supabase_storage_url}/object/{bucket}/{path}"
 
     try:
-        response = httpx.delete(url, headers=_headers(), timeout=15.0)
+        response = await (await client()).delete(
+            url, headers=_headers(), timeout=15.0
+        )
         if response.status_code >= 400:
             logger.warning(
                 "Could not delete %s: %s %s", path, response.status_code, response.text

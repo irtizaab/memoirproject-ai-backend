@@ -23,7 +23,7 @@ router = APIRouter(tags=["billing"])
 
 
 @router.get("/plans", response_model=list[Plan])
-def get_plans():
+async def get_plans():
     """The price list. Public.
 
     No credential, because there is nothing here worth protecting and because
@@ -32,11 +32,11 @@ def get_plans():
     billing screen does, which is the point: two screens quoting one table
     cannot disagree about the price.
     """
-    return list_plans()
+    return await list_plans()
 
 
 @router.get("/billing", response_model=BillingOverview)
-def get_billing(user: CurrentUser = Depends(current_user)):
+async def get_billing(user: CurrentUser = Depends(current_user)):
     """The caller's plan and their real storage consumption.
 
     404 for someone who has signed up but never claimed a draft. They have no
@@ -44,14 +44,14 @@ def get_billing(user: CurrentUser = Depends(current_user)):
     ordinary state on the way through onboarding, not an error worth alarming
     anyone about.
     """
-    overview = get_billing_overview(user.id)
+    overview = await get_billing_overview(user.id)
     if overview is None:
         raise HTTPException(status_code=404, detail="no account yet")
     return overview
 
 
 @router.patch("/billing/plan", response_model=BillingOverview)
-def patch_billing_plan(
+async def patch_billing_plan(
     selection: PlanSelection,
     user: CurrentUser = Depends(current_user),
 ):
@@ -65,7 +65,7 @@ def patch_billing_plan(
     404 covers both "you have no account yet" and "no such plan", deliberately
     undistinguished — see `set_plan`.
     """
-    overview = set_plan(user.id, selection.code)
+    overview = await set_plan(user.id, selection.code)
     if overview is None:
         raise HTTPException(status_code=404, detail="no such plan")
     return overview

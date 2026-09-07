@@ -13,6 +13,7 @@ import logging
 import psycopg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from psycopg_pool import PoolTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,34 @@ def handle_db_error(request: Request, exc: psycopg.Error):
     raise exc
 
 
+def handle_pool_timeout(request: Request, exc: PoolTimeout):
+    """Every connection is busy — say so, quickly.
+
+    The pool hands out a bounded number of connections and makes callers queue
+    for the rest (see integrations/db.py). When the queue does not clear inside
+    `db_pool_timeout`, this is what the caller gets.
+
+    503 rather than 500 because nothing is broken: the service is full, and the
+    condition is temporary. `Retry-After` says so in the one place an impatient
+    client or a load balancer will actually read it — without it, a retry storm
+    arrives while the jam is still clearing and makes it worse.
+
+    Answering fast matters more than it looks. A request left hanging holds a
+    worker and a socket until the client gives up, which is how a slow database
+    turns into an unreachable API.
+    """
+    logger.warning("Connection pool exhausted: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"error": "server_busy"},
+        headers={"Retry-After": "1"},
+    )
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Attach the handlers above to the app. Called once from main.py."""
+    # Registered before psycopg.Error on purpose. PoolTimeout is not a subclass
+    # of it today, and this ordering keeps the specific handler winning if that
+    # ever changes.
+    app.add_exception_handler(PoolTimeout, handle_pool_timeout)
     app.add_exception_handler(psycopg.Error, handle_db_error)

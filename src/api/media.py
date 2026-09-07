@@ -56,7 +56,7 @@ def optional_user_id(
 
 
 @router.post("/uploads", response_model=UploadTicket, status_code=201)
-def post_upload(
+async def post_upload(
     body: UploadRequest,
     user_id: str | None = Depends(optional_user_id),
     x_link_token: str | None = Header(
@@ -82,7 +82,7 @@ def post_upload(
         )
 
     try:
-        ticket = begin_upload(
+        ticket = await begin_upload(
             memoir_id=str(body.memoir_id),
             kind=body.kind,
             mime_type=body.mime_type,
@@ -105,7 +105,7 @@ def post_upload(
 
 
 @router.post("/uploads/{asset_id}/complete", response_model=MediaAsset)
-def post_upload_complete(
+async def post_upload_complete(
     asset_id: UUID,
     background_tasks: BackgroundTasks,
     user_id: str | None = Depends(optional_user_id),
@@ -133,7 +133,7 @@ def post_upload_complete(
         )
 
     try:
-        asset = complete_upload(
+        asset = await complete_upload(
             str(asset_id), user_id=user_id, link_token=x_link_token
         )
     except UploadNotConfirmed:

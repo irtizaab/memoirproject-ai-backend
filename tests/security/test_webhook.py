@@ -25,10 +25,14 @@ def applied(monkeypatch):
     These tests are about the door, not the room behind it.
     """
     calls = []
-    monkeypatch.setattr(
-        "src.api.webhooks.apply_result",
-        lambda provider_id, job=None: calls.append((provider_id, job)) or True,
-    )
+
+    # `apply_result` is a coroutine function now — the route awaits it — so the
+    # stand-in has to be one too, or the await fails on a plain bool.
+    async def fake(provider_id, job=None):
+        calls.append((provider_id, job))
+        return True
+
+    monkeypatch.setattr("src.api.webhooks.apply_result", fake)
     return calls
 
 
@@ -167,9 +171,10 @@ def test_an_unknown_job_is_acknowledged_without_confirming_it_exists(
     made. The response is identical to a successful one, so the body never
     reveals whether a given job id is known to this database.
     """
-    monkeypatch.setattr(
-        "src.api.webhooks.apply_result", lambda provider_id, job=None: False
-    )
+    async def not_ours(provider_id, job=None):
+        return False
+
+    monkeypatch.setattr("src.api.webhooks.apply_result", not_ours)
 
     unknown = client.post(
         "/webhooks/assemblyai",
@@ -177,9 +182,10 @@ def test_an_unknown_job_is_acknowledged_without_confirming_it_exists(
         headers={WEBHOOK_AUTH_HEADER: SECRET},
     )
 
-    monkeypatch.setattr(
-        "src.api.webhooks.apply_result", lambda provider_id, job=None: True
-    )
+    async def ours(provider_id, job=None):
+        return True
+
+    monkeypatch.setattr("src.api.webhooks.apply_result", ours)
     known = client.post(
         "/webhooks/assemblyai",
         json={"transcript_id": "a-real-job", "status": "completed"},

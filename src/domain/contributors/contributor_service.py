@@ -14,7 +14,7 @@ from src.integrations.db import db
 logger = logging.getLogger(__name__)
 
 
-def list_contributors(memoir_id: str, user_id: str) -> dict | None:
+async def list_contributors(memoir_id: str, user_id: str) -> dict | None:
     """Everyone in the memoir and the live link, for the contributors screen.
 
     One call rather than two, because the page shows them together and a
@@ -22,14 +22,14 @@ def list_contributors(memoir_id: str, user_id: str) -> dict | None:
 
     Returns None if the memoir is not this user's.
     """
-    with db() as conn, conn.cursor() as cur:
-        if owned_memoir(cur, memoir_id, user_id) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await owned_memoir(cur, memoir_id, user_id) is None:
             return None
 
         # LEFT JOIN, not INNER: somebody who opened the link and has not
         # written anything yet is exactly who the owner most wants to see, and
         # an inner join would hide them.
-        cur.execute(
+        await cur.execute(
             """
             SELECT p.id,
                    p.display_name,
@@ -61,9 +61,9 @@ def list_contributors(memoir_id: str, user_id: str) -> dict | None:
             """,
             {"memoir_id": memoir_id},
         )
-        participants = cur.fetchall()
+        participants = await cur.fetchall()
 
-        cur.execute(
+        await cur.execute(
             """
             SELECT token, open_count, created_at
               FROM memoir_link
@@ -73,7 +73,7 @@ def list_contributors(memoir_id: str, user_id: str) -> dict | None:
             """,
             {"memoir_id": memoir_id},
         )
-        link = cur.fetchone()
+        link = await cur.fetchone()
 
     # `contributor_token` is deliberately not selected above. It is a
     # credential belonging to the contributor, and the owner has no use for it
@@ -92,7 +92,7 @@ class CannotMerge(Exception):
     """
 
 
-def merge_participants(
+async def merge_participants(
     memoir_id: str, user_id: str, loser_id: str, winner_id: str
 ) -> dict | None:
     """Record that two contributor entries are one person. None if not yours.
@@ -132,14 +132,14 @@ def merge_participants(
     if loser_id == winner_id:
         raise CannotMerge("a participant cannot be merged into itself")
 
-    with db() as conn, conn.cursor() as cur:
-        if owned_memoir(cur, memoir_id, user_id) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await owned_memoir(cur, memoir_id, user_id) is None:
             return None
 
         # Both rows, in one read, scoped to this memoir. `FOR UPDATE` because
         # two merges racing on the same pair could otherwise each see the other
         # as unmerged and produce the chain the docstring rules out.
-        cur.execute(
+        await cur.execute(
             """
             SELECT id, role::text AS role, display_name,
                    merged_into, first_opened_at
@@ -154,7 +154,7 @@ def merge_participants(
                 "winner_id": winner_id,
             },
         )
-        rows = {str(row["id"]): row for row in cur.fetchall()}
+        rows = {str(row["id"]): row for row in await cur.fetchall()}
 
         loser = rows.get(loser_id)
         winner = rows.get(winner_id)
@@ -173,7 +173,7 @@ def merge_participants(
 
         # Move the memories. Filtered on `memoir_id` as well as the participant
         # so a stray id cannot reach across memoirs, the same as everywhere.
-        cur.execute(
+        await cur.execute(
             """
             UPDATE memory
                SET participant_id = %(winner_id)s
@@ -190,7 +190,7 @@ def merge_participants(
 
         # Anything that already pointed at the loser now points at the winner,
         # so no row is ever two hops from the person it belongs to.
-        cur.execute(
+        await cur.execute(
             """
             UPDATE memoir_participant
                SET merged_into = %(winner_id)s
@@ -204,7 +204,7 @@ def merge_participants(
             },
         )
 
-        cur.execute(
+        await cur.execute(
             """
             UPDATE memoir_participant
                SET merged_into = %(winner_id)s
@@ -221,7 +221,7 @@ def merge_participants(
         # The earlier of the two first opens. They are one person, and the
         # honest answer to "when did they first open the link" is whichever
         # device did it first.
-        cur.execute(
+        await cur.execute(
             """
             UPDATE memoir_participant
                SET first_opened_at = LEAST(
@@ -247,7 +247,7 @@ def merge_participants(
     return {"participant_id": winner_id, "memories_moved": moved}
 
 
-def reissue_link(memoir_id: str, user_id: str) -> dict | None:
+async def reissue_link(memoir_id: str, user_id: str) -> dict | None:
     """Kill the current share link and issue a replacement.
 
     The remedy for a link that has been forwarded further than intended.
@@ -264,11 +264,11 @@ def reissue_link(memoir_id: str, user_id: str) -> dict | None:
     to be killed remains readable — which is the only evidence of how widely it
     travelled.
     """
-    with db() as conn, conn.cursor() as cur:
-        if owned_memoir(cur, memoir_id, user_id) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await owned_memoir(cur, memoir_id, user_id) is None:
             return None
 
-        cur.execute(
+        await cur.execute(
             """
             UPDATE memoir_link
                SET revoked_at = now()
@@ -279,7 +279,7 @@ def reissue_link(memoir_id: str, user_id: str) -> dict | None:
             {"memoir_id": memoir_id},
         )
 
-        cur.execute(
+        await cur.execute(
             """
             INSERT INTO memoir_link (memoir_id, scope)
             VALUES (%(memoir_id)s, 'contribute')
@@ -287,4 +287,4 @@ def reissue_link(memoir_id: str, user_id: str) -> dict | None:
             """,
             {"memoir_id": memoir_id},
         )
-        return cur.fetchone()
+        return await cur.fetchone()

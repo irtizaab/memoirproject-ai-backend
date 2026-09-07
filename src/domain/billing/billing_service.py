@@ -16,7 +16,7 @@ from src.integrations.db import db
 logger = logging.getLogger(__name__)
 
 
-def get_billing_overview(user_id: str) -> dict | None:
+async def get_billing_overview(user_id: str) -> dict | None:
     """The plan this account is on, and its real storage consumption.
 
     Returns None if the account has no `user_account` row — which happens to
@@ -27,8 +27,8 @@ def get_billing_overview(user_id: str) -> dict | None:
     The `used_bytes` figure is summed from confirmed uploads, never from
     anything the client reported. See `storage_used_bytes`.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT p.code,
                    p.name,
@@ -43,7 +43,7 @@ def get_billing_overview(user_id: str) -> dict | None:
             """,
             {"user_id": user_id},
         )
-        plan = cur.fetchone()
+        plan = await cur.fetchone()
 
     if plan is None:
         return None
@@ -51,7 +51,7 @@ def get_billing_overview(user_id: str) -> dict | None:
     return {
         "plan": plan,
         "storage": {
-            "used_bytes": storage_used_bytes(user_id),
+            "used_bytes": await storage_used_bytes(user_id),
             "limit_bytes": plan["storage_limit_bytes"],
         },
         # No renewal date, and none invented. Nothing has been charged, so
@@ -62,7 +62,7 @@ def get_billing_overview(user_id: str) -> dict | None:
     }
 
 
-def list_plans() -> list[dict]:
+async def list_plans() -> list[dict]:
     """Every plan that can still be signed up for, cheapest first.
 
     Public — this is a price list, and the pricing screen reads it before the
@@ -74,8 +74,8 @@ def list_plans() -> list[dict]:
     rather than a delete), and `get_billing_overview` will still report one
     correctly — it joins on the code, not on availability.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT code,
                    name,
@@ -89,10 +89,10 @@ def list_plans() -> list[dict]:
              ORDER BY price_cents
             """
         )
-        return cur.fetchall()
+        return await cur.fetchall()
 
 
-def set_plan(user_id: str, code: str) -> dict | None:
+async def set_plan(user_id: str, code: str) -> dict | None:
     """Move an account onto a plan, and return its refreshed billing overview.
 
     This is an entitlement change, not a payment. Nothing is charged, so
@@ -109,8 +109,8 @@ def set_plan(user_id: str, code: str) -> dict | None:
     The UPDATE is filtered on `is_available` so a retired plan cannot be
     selected. The foreign key alone would allow it.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             UPDATE user_account
                SET plan_code = %(code)s
@@ -123,9 +123,9 @@ def set_plan(user_id: str, code: str) -> dict | None:
             """,
             {"user_id": user_id, "code": code},
         )
-        if cur.fetchone() is None:
+        if await cur.fetchone() is None:
             return None
 
     # Read back through the same function the GET uses, so the response cannot
     # drift from what the billing screen would fetch a moment later.
-    return get_billing_overview(user_id)
+    return await get_billing_overview(user_id)

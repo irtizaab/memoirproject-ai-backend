@@ -60,7 +60,7 @@ TERMINAL = ("done", "failed", "skipped")
 # ---------------------------------------------------------------------------
 
 
-def _over_budget(memoir_id: str, incoming_ms: int) -> bool:
+async def _over_budget(memoir_id: str, incoming_ms: int) -> bool:
     """Whether transcribing this recording would exceed the memoir's allowance.
 
     The allowance lives on the plan the memoir's owner is on
@@ -89,8 +89,8 @@ def _over_budget(memoir_id: str, incoming_ms: int) -> bool:
     worse of the two errors, and the cost of being wrong is pennies.
     """
     try:
-        with db() as conn, conn.cursor() as cur:
-            cur.execute(
+        async with db() as conn, conn.cursor() as cur:
+            await cur.execute(
                 """
                 SELECT p.transcription_minutes,
                        COALESCE(
@@ -116,13 +116,13 @@ def _over_budget(memoir_id: str, incoming_ms: int) -> bool:
                 """,
                 {"memoir_id": memoir_id},
             )
-            row = cur.fetchone()
+            row = await cur.fetchone()
 
             if row is None:
                 # No transcribed audio yet, so nothing is used — but the plan's
                 # limit still has to be read, since a limit of zero would mean
                 # the very first recording is already over.
-                cur.execute(
+                await cur.execute(
                     """
                     SELECT p.transcription_minutes
                       FROM memoir mo
@@ -132,7 +132,7 @@ def _over_budget(memoir_id: str, incoming_ms: int) -> bool:
                     """,
                     {"memoir_id": memoir_id},
                 )
-                limit_row = cur.fetchone()
+                limit_row = await cur.fetchone()
                 if limit_row is None:
                     return False
                 row = {
@@ -147,7 +147,7 @@ def _over_budget(memoir_id: str, incoming_ms: int) -> bool:
     return (row["used_ms"] + incoming_ms) > limit_ms
 
 
-def request_transcription(asset_id: str) -> None:
+async def request_transcription(asset_id: str) -> None:
     """Send one audio asset for transcription. Never raises.
 
     Called from a background task after an upload is confirmed, so nothing it
@@ -161,8 +161,8 @@ def request_transcription(asset_id: str) -> None:
     across them would tie one up for the duration of somebody else's latency —
     the same reasoning as `begin_upload()`.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT id, memoir_id, duration_ms, storage_path,
                    kind::text AS kind, uploaded_at
@@ -171,7 +171,7 @@ def request_transcription(asset_id: str) -> None:
             """,
             {"asset_id": asset_id},
         )
-        asset = cur.fetchone()
+        asset = await cur.fetchone()
 
     if asset is None:
         logger.warning("Asked to transcribe asset %s, which does not exist", asset_id)
@@ -189,10 +189,10 @@ def request_transcription(asset_id: str) -> None:
     if not settings.transcription_enabled or not settings.assemblyai_api_key:
         # Not a failure. Nothing went wrong and nothing should be retried, so
         # the row says so plainly rather than pretending an error occurred.
-        _record(asset_id, status="skipped")
+        await _record(asset_id, status="skipped")
         return
 
-    if _over_budget(str(asset["memoir_id"]), asset["duration_ms"] or 0):
+    if await _over_budget(str(asset["memoir_id"]), asset["duration_ms"] or 0):
         # Also not a failure — a deliberate decision not to spend. 'skipped'
         # rather than 'failed' is what stops a retry pass from spending it
         # anyway later.
@@ -201,30 +201,30 @@ def request_transcription(asset_id: str) -> None:
             asset["memoir_id"],
             asset_id,
         )
-        _record(asset_id, status="skipped")
+        await _record(asset_id, status="skipped")
         return
 
-    _record(asset_id, status="queued")
+    await _record(asset_id, status="queued")
 
     try:
-        audio_url = create_signed_download_url(asset["storage_path"])
+        audio_url = await create_signed_download_url(asset["storage_path"])
     except StorageError as exc:
         logger.error("Could not sign audio for transcription: %s", exc)
-        _record(asset_id, status="failed", error=f"could not sign audio: {exc}")
+        await _record(asset_id, status="failed", error=f"could not sign audio: {exc}")
         return
 
     try:
-        job = submit(audio_url)
+        job = await submit(audio_url)
     except TranscriptionError as exc:
         logger.error("Could not submit asset %s for transcription: %s", asset_id, exc)
-        _record(asset_id, status="failed", error=str(exc))
+        await _record(asset_id, status="failed", error=str(exc))
         return
 
-    _record(asset_id, status="processing", provider_id=job["id"])
+    await _record(asset_id, status="processing", provider_id=job["id"])
     logger.info("Asset %s submitted for transcription as job %s", asset_id, job["id"])
 
 
-def _record(
+async def _record(
     asset_id: str,
     *,
     status: str,
@@ -237,8 +237,8 @@ def _record(
     an earlier attempt, and two background tasks racing on the same asset must
     not produce a duplicate-key error in a place with nobody to report it to.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             INSERT INTO transcript (asset_id, status, provider_id, error)
             VALUES (%(asset_id)s, %(status)s::transcript_status,
@@ -264,7 +264,7 @@ def _record(
 # ---------------------------------------------------------------------------
 
 
-def apply_result(provider_id: str, job: dict | None = None) -> bool:
+async def apply_result(provider_id: str, job: dict | None = None) -> bool:
     """Write a finished job into the transcript row. Returns whether it landed.
 
     The single place a transcript is ever written. Both the webhook and
@@ -292,7 +292,7 @@ def apply_result(provider_id: str, job: dict | None = None) -> bool:
     # with `text` present and empty, and that is a real answer, not a gap.
     if job is None or (job.get("status") == "completed" and "text" not in job):
         try:
-            job = fetch(provider_id)
+            job = await fetch(provider_id)
         except TranscriptionError as exc:
             logger.warning("Could not fetch job %s to apply it: %s", provider_id, exc)
             return False
@@ -305,14 +305,14 @@ def apply_result(provider_id: str, job: dict | None = None) -> bool:
             # A recording of silence, or of a room with nobody speaking in it.
             # Genuinely completed, genuinely empty — and a `done` row with no
             # text would violate the table's own CHECK constraint.
-            return _write_terminal(
+            return await _write_terminal(
                 provider_id,
                 status="failed",
                 error="the recording contained no speech",
             )
 
-        segments = _segments_for(provider_id)
-        return _write_terminal(
+        segments = await _segments_for(provider_id)
+        return await _write_terminal(
             provider_id,
             status="done",
             text=text,
@@ -323,7 +323,7 @@ def apply_result(provider_id: str, job: dict | None = None) -> bool:
         )
 
     if status == "error":
-        return _write_terminal(
+        return await _write_terminal(
             provider_id,
             status="failed",
             error=job.get("error") or "the provider did not say why",
@@ -349,7 +349,7 @@ def _audio_seconds(job: dict) -> int | None:
     return seconds if seconds > 0 else None
 
 
-def _segments_for(provider_id: str) -> list[dict]:
+async def _segments_for(provider_id: str) -> list[dict]:
     """Paragraph segments, reduced to the three fields worth keeping.
 
     AssemblyAI's paragraph objects carry confidence and a nested word array
@@ -363,12 +363,12 @@ def _segments_for(provider_id: str) -> list[dict]:
             "end": paragraph.get("end"),
             "text": paragraph.get("text", ""),
         }
-        for paragraph in paragraphs(provider_id)
+        for paragraph in await paragraphs(provider_id)
         if paragraph.get("text")
     ]
 
 
-def _write_terminal(
+async def _write_terminal(
     provider_id: str,
     *,
     status: str,
@@ -386,8 +386,8 @@ def _write_terminal(
     still returns True in that case — the outcome the caller wanted is a fact,
     whoever wrote it.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             UPDATE transcript
                SET status        = %(status)s::transcript_status,
@@ -416,17 +416,17 @@ def _write_terminal(
                 "error": error,
             },
         )
-        if cur.fetchone() is not None:
+        if await cur.fetchone() is not None:
             return True
 
         # Nothing updated. Either we have never seen this job, or it was
         # already finished — two very different things, and only the first is
         # worth telling the caller about.
-        cur.execute(
+        await cur.execute(
             "SELECT 1 FROM transcript WHERE provider_id = %(provider_id)s",
             {"provider_id": provider_id},
         )
-        return cur.fetchone() is not None
+        return await cur.fetchone() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +434,7 @@ def _write_terminal(
 # ---------------------------------------------------------------------------
 
 
-def transcripts_for_assets(cur, asset_ids: list[str]) -> dict[str, dict]:
+async def transcripts_for_assets(cur, asset_ids: list[str]) -> dict[str, dict]:
     """Every transcript for a set of assets, keyed by asset id.
 
     Takes a cursor so it composes inside the caller's transaction — the same
@@ -450,7 +450,7 @@ def transcripts_for_assets(cur, asset_ids: list[str]) -> dict[str, dict]:
     if not asset_ids:
         return {}
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT asset_id, status::text AS status, provider_id, text, segments,
                language_code, confidence, requested_at
@@ -459,10 +459,10 @@ def transcripts_for_assets(cur, asset_ids: list[str]) -> dict[str, dict]:
         """,
         {"asset_ids": asset_ids},
     )
-    return {str(row["asset_id"]): row for row in cur.fetchall()}
+    return {str(row["asset_id"]): row for row in await cur.fetchall()}
 
 
-def reconcile(asset_ids: list[str]) -> None:
+async def reconcile(asset_ids: list[str]) -> None:
     """Chase transcripts that are still in flight. Never raises.
 
     The safety net. Called from a route handler before it reads memories back,
@@ -476,8 +476,8 @@ def reconcile(asset_ids: list[str]) -> None:
     if not asset_ids:
         return
 
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT provider_id
               FROM transcript
@@ -494,11 +494,11 @@ def reconcile(asset_ids: list[str]) -> None:
                 "limit": _RECONCILE_LIMIT,
             },
         )
-        pending = [row["provider_id"] for row in cur.fetchall()]
+        pending = [row["provider_id"] for row in await cur.fetchall()]
 
     for provider_id in pending:
         try:
-            apply_result(provider_id, fetch(provider_id))
+            await apply_result(provider_id, fetch(provider_id))
         except TranscriptionError as exc:
             # Reading an archive must not fail because a third party is having
             # a bad afternoon. The transcript stays 'processing' and the next
@@ -532,7 +532,7 @@ def to_payload(row: dict | None) -> dict | None:
     }
 
 
-def refresh_pending(memories: list[dict]) -> list[dict]:
+async def refresh_pending(memories: list[dict]) -> list[dict]:
     """Chase any in-flight transcripts in a list of memories, and patch them in.
 
     The safety net's entry point, called by the two list routes after the
@@ -555,12 +555,12 @@ def refresh_pending(memories: list[dict]) -> list[dict]:
     if not pending:
         return memories
 
-    reconcile(pending)
+    await reconcile(pending)
 
     # Re-read only the transcripts that were in flight, and only if something
     # might have changed. One query, no re-signing of URLs.
-    with db() as conn, conn.cursor() as cur:
-        fresh = transcripts_for_assets(cur, pending)
+    async with db() as conn, conn.cursor() as cur:
+        fresh = await transcripts_for_assets(cur, pending)
 
     for memory in memories:
         for asset in memory.get("assets", []):

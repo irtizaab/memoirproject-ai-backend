@@ -13,6 +13,7 @@ import jwt
 from jwt import PyJWKClient
 
 from src.core.config import settings
+from src.integrations.http import client
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ def verify_access_token(token: str) -> dict:
     return claims
 
 
-def password_signin(email: str, password: str) -> dict:
+async def password_signin(email: str, password: str) -> dict:
     """Exchange an email and password for a real Supabase session. DEV ONLY.
 
     This is the one place the API talks to Supabase Auth over HTTP rather than
@@ -128,18 +129,19 @@ def password_signin(email: str, password: str) -> dict:
     }
     body = {"email": email, "password": password}
 
-    with httpx.Client(timeout=20) as client:
-        # Best-effort account creation. A 4xx here means "already exists" (or
-        # a weak password), both of which the sign-in below reports properly.
-        signup = client.post(f"{base}/auth/v1/signup", json=body, headers=headers)
-        logger.info("dev signup -> %s", signup.status_code)
+    http = await client()
 
-        signin = client.post(
-            f"{base}/auth/v1/token",
-            params={"grant_type": "password"},
-            json=body,
-            headers=headers,
-        )
+    # Best-effort account creation. A 4xx here means "already exists" (or a
+    # weak password), both of which the sign-in below reports properly.
+    signup = await http.post(f"{base}/auth/v1/signup", json=body, headers=headers)
+    logger.info("dev signup -> %s", signup.status_code)
+
+    signin = await http.post(
+        f"{base}/auth/v1/token",
+        params={"grant_type": "password"},
+        json=body,
+        headers=headers,
+    )
 
     if signin.status_code != 200:
         # Surfaced verbatim so the cause is obvious while developing — most

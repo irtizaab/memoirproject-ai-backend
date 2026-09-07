@@ -27,6 +27,32 @@ def test_health_reports_the_database(client):
     assert response.json() == {"status": "ok", "database": 1}
 
 
+def test_a_full_connection_pool_is_a_fast_503(client, monkeypatch):
+    """Every connection busy is "come back", not "the server broke".
+
+    The pool hands out a bounded number of connections and queues the rest; a
+    wait longer than DB_POOL_TIMEOUT raises PoolTimeout. Nothing is broken when
+    that happens — the service is full, and the condition is temporary — so it
+    has to reach the client as a 503 with a Retry-After, not as a 500.
+
+    Worth a test because the failure is silent: the handler registration in
+    core/error_handlers.py could be dropped and every other test would still
+    pass, while production started answering 500 to its own busiest moments.
+    """
+    from psycopg_pool import PoolTimeout
+
+    async def full(*args, **kwargs):
+        raise PoolTimeout("pool exhausted")
+
+    monkeypatch.setattr("src.api.health.ping", full)
+
+    response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "server_busy"}
+    assert response.headers["Retry-After"] == "1"
+
+
 def test_the_price_list_is_public(client):
     """Deliberately unauthenticated.
 

@@ -41,12 +41,13 @@ app = FastAPI(title="The Memoir Project API", lifespan=lifespan)
 # different origins, so without this every request from the browser fails
 # before it reaches any of the code below.
 #
-# TODO: allow_origins=["*"] is fine for local development and wrong for
-# production. Replace it with the real frontend origin before deploying.
-# It is tolerable today only because auth is a header token, not a cookie.
+# The list comes from ALLOWED_ORIGINS rather than being hardcoded to "*". The
+# default is still "*" so a laptop needs no configuration, but every deployed
+# environment must set the real frontend origin: "*" lets any page on the
+# internet call this API with a token it has got hold of.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.allowed_origins_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )

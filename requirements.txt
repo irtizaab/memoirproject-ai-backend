@@ -24,6 +24,7 @@ MarkupSafe==3.0.3
 mdurl==0.1.2
 psycopg-binary==3.3.4
 psycopg==3.3.4
+psycopg-pool==3.2.6
 pycparser==3.0
 pydantic-extra-types==2.11.1
 pydantic-settings==2.15.0

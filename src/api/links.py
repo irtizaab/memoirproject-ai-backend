@@ -17,7 +17,7 @@ router = APIRouter(tags=["links"])
 
 
 @router.get("/j/{token}", response_model=LinkInvitation)
-def get_invitation(token: str):
+async def get_invitation(token: str):
     """Resolve a share link into the memoir it points at.
 
     `/j/` is short on purpose. This URL gets forwarded in WhatsApp messages
@@ -35,7 +35,7 @@ def get_invitation(token: str):
     accident. The owner's private `never_forget` answer is excluded for
     exactly that reason.
     """
-    invitation = resolve_link(token)
+    invitation = await resolve_link(token)
 
     # Unknown and revoked look identical from out here, on purpose.
     if invitation is None:

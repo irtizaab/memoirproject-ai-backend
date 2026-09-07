@@ -58,14 +58,14 @@ _EMPTY = "a memory needs something in it — writing, a photograph, or a recordi
 
 
 @router.get("/memoirs/{memoir_id}/memories", response_model=list[Memory])
-def get_memories(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+async def get_memories(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
     """Every memory in the memoir, newest first.
 
     404 covers both "no such memoir" and "not yours", deliberately. Answering
     403 for the second would confirm the id belongs to a real memoir, which is
     a small leak but a free one to avoid.
     """
-    memories = list_memories(str(memoir_id), user.id)
+    memories = await list_memories(str(memoir_id), user.id)
     if memories is None:
         raise HTTPException(status_code=404, detail="memoir not found")
 
@@ -73,11 +73,11 @@ def get_memories(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
     # closed. Costs nothing when there is nothing pending — which, once the
     # webhook is reachable, is nearly always. On a laptop it is the only way a
     # transcript ever arrives.
-    return refresh_pending(memories)
+    return await refresh_pending(memories)
 
 
 @router.get("/memories/{memory_id}", response_model=Memory)
-def get_one_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
+async def get_one_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
     """One memory in full, for the detail page.
 
     404 for both "no such memory" and "not yours", as everywhere else — the API
@@ -87,16 +87,16 @@ def get_one_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
     still being written out picks the result up rather than waiting for the
     archive list to be visited again.
     """
-    memory = get_memory(str(memory_id), user.id)
+    memory = await get_memory(str(memory_id), user.id)
     if memory is None:
         raise HTTPException(status_code=404, detail="memory not found")
-    return refresh_pending([memory])[0]
+    return (await refresh_pending([memory]))[0]
 
 
 @router.post(
     "/memoirs/{memoir_id}/memories", response_model=Memory, status_code=201
 )
-def post_memory(
+async def post_memory(
     memoir_id: UUID,
     body: MemoryCreate,
     user: CurrentUser = Depends(current_user),
@@ -108,7 +108,7 @@ def post_memory(
     see `_derive_kind`.
     """
     try:
-        memory = create_memory(str(memoir_id), user.id, body.model_dump())
+        memory = await create_memory(str(memoir_id), user.id, body.model_dump())
     except EmptyMemory:
         raise HTTPException(status_code=400, detail=_EMPTY)
     except MemoirPublished:
@@ -120,7 +120,7 @@ def post_memory(
 
 
 @router.patch("/memories/{memory_id}", response_model=Memory)
-def patch_memory(
+async def patch_memory(
     memory_id: UUID,
     body: MemoryUpdate,
     user: CurrentUser = Depends(current_user),
@@ -136,7 +136,7 @@ def patch_memory(
         raise HTTPException(status_code=400, detail="nothing to update")
 
     try:
-        memory = update_memory(str(memory_id), user.id, fields)
+        memory = await update_memory(str(memory_id), user.id, fields)
     except EmptyMemory:
         # Clearing the words off a memory that holds nothing else. Same rule
         # and same sentence as creating one — the edit is rolled back.
@@ -150,14 +150,14 @@ def patch_memory(
 
 
 @router.delete("/memories/{memory_id}", status_code=204)
-def remove_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
+async def remove_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
     """Delete a memory and the files it held.
 
     204 with no body: there is nothing meaningful to return about something
     that no longer exists.
     """
     try:
-        deleted = delete_memory(str(memory_id), user.id)
+        deleted = await delete_memory(str(memory_id), user.id)
     except MemoirPublished:
         raise HTTPException(status_code=409, detail=_PUBLISHED)
 
@@ -166,7 +166,7 @@ def remove_memory(memory_id: UUID, user: CurrentUser = Depends(current_user)):
 
 
 @router.post("/memories/{memory_id}/assets", response_model=Memory)
-def post_memory_assets(
+async def post_memory_assets(
     memory_id: UUID,
     body: AssetAttachment,
     user: CurrentUser = Depends(current_user),
@@ -182,7 +182,7 @@ def post_memory_assets(
     so the client never has to guess what changed.
     """
     try:
-        memory = attach_assets(
+        memory = await attach_assets(
             str(memory_id), user.id, [str(asset_id) for asset_id in body.asset_ids]
         )
     except MemoirPublished:
@@ -194,7 +194,7 @@ def post_memory_assets(
 
 
 @router.delete("/memories/{memory_id}/assets/{asset_id}", response_model=Memory)
-def delete_memory_asset(
+async def delete_memory_asset(
     memory_id: UUID,
     asset_id: UUID,
     user: CurrentUser = Depends(current_user),
@@ -210,7 +210,7 @@ def delete_memory_asset(
     applying after the first save. Nothing is deleted in that case.
     """
     try:
-        memory = remove_asset(str(memory_id), user.id, str(asset_id))
+        memory = await remove_asset(str(memory_id), user.id, str(asset_id))
     except EmptyMemory:
         raise HTTPException(status_code=400, detail=_EMPTY)
     except MemoirPublished:
@@ -229,7 +229,7 @@ def delete_memory_asset(
 @router.post(
     "/j/{token}/memories", response_model=ContributionReceipt, status_code=201
 )
-def post_contribution(token: str, body: ContributedMemory):
+async def post_contribution(token: str, body: ContributedMemory):
     """Leave a memory through a share link, with no account.
 
     No `Depends(current_user)`, and that is the product working as designed.
@@ -243,7 +243,7 @@ def post_contribution(token: str, body: ContributedMemory):
     recognised as the same person rather than appearing in the archive twice.
     """
     try:
-        result = contribute_memory(token, body.model_dump())
+        result = await contribute_memory(token, body.model_dump())
     except EmptyMemory:
         raise HTTPException(status_code=400, detail=_EMPTY)
 
@@ -257,7 +257,7 @@ def post_contribution(token: str, body: ContributedMemory):
 
 
 @router.get("/j/{token}/memories", response_model=list[Memory])
-def get_contributions(
+async def get_contributions(
     token: str,
     x_participant_token: str = Header(
         ..., description="token returned by POST /j/{token}/memories"
@@ -269,10 +269,10 @@ def get_contributions(
     see the archive or anyone else's memories, and the WHERE clause behind this
     is where that promise is kept rather than merely stated.
     """
-    memories = list_contributions(token, x_participant_token)
+    memories = await list_contributions(token, x_participant_token)
     if memories is None:
         raise HTTPException(status_code=404, detail="link not found")
 
     # A contributor watches their own recording being transcribed too, so this
     # side gets the same treatment. Still scoped to their participant row.
-    return refresh_pending(memories)
+    return await refresh_pending(memories)

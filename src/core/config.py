@@ -25,6 +25,29 @@ class Settings(BaseSettings):
     # --- Postgres -----------------------------------------------------------
     database_url: str
 
+    # Connection pool sizing. These are per *process*: main.py is served by
+    # several uvicorn workers, so the real ceiling on connections against
+    # Postgres is workers x db_pool_max_size. Size them together against
+    # whatever the database (or its pooler) actually allows, or a rolling
+    # deploy will exhaust it while old and new workers overlap.
+    db_pool_min_size: int = 1
+    db_pool_max_size: int = 20
+
+    # Seconds a request waits for a free connection before the pool gives up.
+    # Bounded on purpose — see the note in integrations/db.py. A request that
+    # cannot get a connection becomes a fast 503, not a hang.
+    db_pool_timeout: float = 10.0
+
+    # --- CORS ---------------------------------------------------------------
+    # Comma-separated list of origins the browser may call this API from, e.g.
+    # "https://app.example.com,https://staging.example.com".
+    #
+    # The default is "*", which is right for a laptop and wrong for production:
+    # it lets any page on the internet call this API with a token it has got
+    # hold of. Set it to the real frontend origin in every deployed
+    # environment. See `allowed_origins_list` below for the parsed form.
+    allowed_origins: str = "*"
+
     # --- Supabase Auth ------------------------------------------------------
     # The project's base URL, e.g. https://abcdefgh.supabase.co
     #
@@ -129,6 +152,16 @@ class Settings(BaseSettings):
         if not self.public_base_url or not self.assemblyai_webhook_secret:
             return None
         return f"{self.public_base_url.rstrip('/')}/webhooks/assemblyai"
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        """`allowed_origins` as the list CORSMiddleware wants.
+
+        Split and stripped here rather than at the call site so that a value
+        with a stray space after a comma does not quietly become an origin that
+        matches nothing — a CORS failure that looks like a frontend bug.
+        """
+        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
     @property
     def supabase_issuer(self) -> str:

@@ -13,7 +13,7 @@ from src.integrations.db import db
 logger = logging.getLogger(__name__)
 
 
-def create_draft() -> dict:
+async def create_draft() -> dict:
     """Start a new anonymous onboarding draft.
 
     Called before the user has an account — they haven't even reached the
@@ -24,13 +24,13 @@ def create_draft() -> dict:
     this draft, since there is no logged-in user to check against. The browser
     stores it and sends it back as the X-Draft-Token header on every update.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO memoir_draft DEFAULT VALUES RETURNING id, token")
-        row = cur.fetchone()
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute("INSERT INTO memoir_draft DEFAULT VALUES RETURNING id, token")
+        row = await cur.fetchone()
     return {"id": row["id"], "token": row["token"]}
 
 
-def update_draft(draft_id: str, token: str, fields: dict) -> dict | None:
+async def update_draft(draft_id: str, token: str, fields: dict) -> dict | None:
     """Save one or more onboarding answers onto an existing draft.
 
     `fields` is a plain dict of column name -> value, already filtered down to
@@ -65,8 +65,8 @@ def update_draft(draft_id: str, token: str, fields: dict) -> dict | None:
     params["draft_id"] = draft_id
     params["token"] = token
 
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             f"""
             UPDATE memoir_draft
                SET {sets}, updated_at = now()
@@ -78,7 +78,7 @@ def update_draft(draft_id: str, token: str, fields: dict) -> dict | None:
             """,
             params,
         )
-        row = cur.fetchone()
+        row = await cur.fetchone()
 
     # Already None when the WHERE matched nothing, so there is nothing to check.
     return row

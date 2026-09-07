@@ -197,7 +197,8 @@ it returns fluent, confident nonsense, which is worse.
   part that gets expensive to change once a prompt is written against it.
 
 Throughout: a central `psycopg.Error` handler mapping SQLSTATE codes to clean
-4xx JSON responses instead of raw 500s, in `src/core/error_handlers.py`.
+4xx JSON responses instead of raw 500s, plus a `PoolTimeout` handler answering
+503 when every connection is busy — both in `src/core/error_handlers.py`.
 
 File layout:
 
@@ -206,11 +207,12 @@ src/
   main.py                            wiring only: app, CORS, error handlers, routers
   core/
     config.py                        settings.* — the only place env is read
-    error_handlers.py                psycopg.Error -> 400/409
+    error_handlers.py                psycopg.Error -> 400/409, PoolTimeout -> 503
     app_lifespan.py                  startup/shutdown hook
     logging_config.py                setup_logging()
   integrations/
-    db.py                            db() connection, ping()
+    db.py                            db() pooled connection, open_pool(), ping()
+    http.py                          client() — the one shared httpx.AsyncClient
     supabase_auth.py                 verify_access_token(), password_signin()
     supabase_storage.py              signed upload/download URLs, object_size()
     assemblyai.py                    submit(), fetch(), paragraphs()
@@ -261,13 +263,11 @@ src/
     dev.py                           POST /dev/signin             (gated)
 ```
 
-The `example_*` files alongside these are leftover template scaffolding, kept
-as a reference. They are not wired into the app.
-
 Environment variables (`.env`): `DATABASE_URL`, `SUPABASE_URL`,
 `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `ENABLE_DEV_ROUTES`,
 `ASSEMBLYAI_API_KEY`, `ASSEMBLYAI_WEBHOOK_SECRET`, `PUBLIC_BASE_URL`,
-`TRANSCRIPTION_ENABLED`.
+`TRANSCRIPTION_ENABLED`, `ALLOWED_ORIGINS`, `DB_POOL_MIN_SIZE`,
+`DB_POOL_MAX_SIZE`, `DB_POOL_TIMEOUT`.
 
 `PUBLIC_BASE_URL` is deliberately **empty in local development** — localhost is
 not reachable from the internet, so no webhook is requested and the poll path
@@ -454,11 +454,12 @@ Requests flow one direction: **`api/` → `domain/` → `integrations/`**
 - **`src/domain/<feature>/`** — the business logic and the SQL. Must not import `fastapi`; this
   layer does not know what a 404 is. It returns `None` or raises its own errors, and the route
   decides what that means over HTTP.
-- **`src/integrations/`** — thin wrappers around external services (Postgres, Supabase, LLMs).
-  No feature knowledge. If the word "memoir" appears here, it's in the wrong file.
+- **`src/integrations/`** — thin wrappers around external services (Postgres, Supabase Auth
+  and Storage, AssemblyAI), plus the shared HTTP client they all call through. No feature
+  knowledge. If the word "memoir" appears here, it's in the wrong file.
 - **`src/models/`** — Pydantic request/response models, one file per feature.
-- **`src/core/`** — app-wide setup: config, logging, lifespan hooks.
-- **`src/utils/`** — generic helpers not tied to a feature.
+- **`src/core/`** — app-wide setup: config, logging, error handlers, the lifespan that opens
+  and closes the connection pool and the HTTP client.
 
 The PR review bot in `.github/workflows/opencode.yml` checks this, and so does `README.md`.
 
@@ -487,13 +488,22 @@ Then register the router in `src/main.py`. `src/main.py` is wiring only — if y
 
 ### Code style
 
-The `example_*` files under `src/` are leftover template scaffolding kept as a reference. Where
-they disagree with the real Memoir code, **the Memoir code wins**:
-
 - `str | None`, not `Optional[str]`.
-- `def` route handlers, not `async def` — psycopg is synchronous here, and `def` lets FastAPI run
-  the handler in a threadpool instead of blocking the event loop.
-- No `__init__.py` files. `src/` uses implicit namespace packages.
+- **`async def` route handlers, not `def`.** The whole stack is asynchronous: psycopg's
+  `AsyncConnection` through the pool in `src/integrations/db.py`, and one shared
+  `httpx.AsyncClient` in `src/integrations/http.py`. A plain `def` handler is run in a
+  threadpool with no loop underneath it and cannot await either.
+- **Never call a synchronous driver from `src/`.** No `psycopg.connect()`, no `httpx.get()`,
+  no `httpx.Client()`. One of them blocks the event loop for its whole duration and with it
+  every other request the worker is serving — no error, no failing test, just latency under
+  load. `test_no_blocking_io_in_src` in `tests/static/test_layering.py` is what catches it.
+  The two correct forms are `async with db() as conn, conn.cursor() as cur:` and
+  `await (await client()).get(...)`.
+- Pure helpers and FastAPI dependencies that only do CPU work (`current_user`,
+  `optional_user_id`) stay `def`. FastAPI runs a sync dependency in a threadpool, which is
+  right for JWT verification and wrong for anything that touches the network.
+- No `__init__.py` files under `src/`, which uses implicit namespace packages. `tests/` does
+  have one, so the project's `tests` package is not shadowed by an unrelated installed one.
 
 ### Config
 
@@ -503,8 +513,15 @@ on purpose — better than failing on the first request.
 
 ### Database
 
-- Connect via `db()` from `src/integrations/db.py`. It returns `dict_row` rows, which is why
-  handlers can return a row straight to FastAPI as JSON.
+- Borrow a connection via `db()` from `src/integrations/db.py`:
+  `async with db() as conn, conn.cursor() as cur:` — then `await cur.execute(...)` and
+  `await cur.fetchone()`. Leaving the block commits, or rolls back if an exception escaped,
+  and returns the connection to the pool. Rows come back as `dict_row`, which is why a
+  handler can return one straight to FastAPI as JSON.
+- The pool is opened and closed by the lifespan in `src/core/app_lifespan.py`, sized by
+  `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE`. Those are **per process**: the real ceiling on
+  connections is `uvicorn --workers` x `DB_POOL_MAX_SIZE`. When the pool is empty callers
+  queue, and a wait longer than `DB_POOL_TIMEOUT` becomes a 503 rather than a hang.
 - **Every query must be filtered by its owning id** — `memoir_id`, or a draft's `id` + `token`.
   Row Level Security is enabled on all five tables with **zero policies**, and the API connects
   with a role that bypasses RLS. That means the route handlers are the *only* thing protecting
@@ -574,7 +591,7 @@ and `README.md` use.
   | `api/` | 72 tests. Every endpoint at least once, answering the codes it documents — including the chapter and comment boundaries added with migration `0011` (`test_chapters.py`). Those last are really security tests wearing an `api/` label; if that file grows, split them out. |
   | `unit/` | 37 tests. Config, models, transcript payloads — no database. |
   | `db/` | 19 tests. That the CHECK constraints and partial indexes actually refuse what they claim to. |
-  | `static/` | 14 tests. The conventions in this file, enforced by reading the source: no SQL in `api/`, no `fastapi` in `domain/`, no memoir vocabulary in `integrations/`, no route defined in `main.py`, no blanket `except Exception`, handlers `def` and not `async def`, the service role key confined to one module, and **the API never answering 403**. |
+  | `static/` | The conventions in this file, enforced by reading the source: no SQL in `api/`, no `fastapi` in `domain/`, no memoir vocabulary in `integrations/`, no route defined in `main.py`, no blanket `except Exception`, **every handler `async def`**, **no synchronous driver call anywhere under `src/`**, the service role key confined to one module, and **the API never answering 403**. |
 
   Fixtures build rows with SQL rather than by calling the API, so a test about deletion fails only
   when deletion is broken — and so it can construct states the application cannot reach, such as a
@@ -591,9 +608,7 @@ and `README.md` use.
   reservation nobody attaches to anything is paid for once. Same orphan class as
   above, now with a cost attached.
 - **A failed transcript is never retried.** Nothing re-submits it.
-- CORS is still `allow_origins=["*"]`. Tolerable while auth is a header token and not a cookie;
-  must become the real frontend origin before deploying.
-- `db()` opens a fresh connection per call with no pooling. Fine at current traffic; when it
-  stops being fine, a pool goes in `src/integrations/db.py` and every caller keeps working.
+- CORS defaults to `*` when `ALLOWED_ORIGINS` is unset, which is right for a laptop and wrong
+  everywhere else. Every deployed environment must set the real frontend origin.
 - A contributor's `participant_token` never expires and cannot be revoked individually. Revoking
   the share link stops new contributions from everyone at once, which is the only lever there is.

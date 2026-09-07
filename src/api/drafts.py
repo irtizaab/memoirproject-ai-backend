@@ -21,17 +21,17 @@ router = APIRouter(prefix="/drafts", tags=["drafts"])
 
 
 @router.post("")
-def post_draft():
+async def post_draft():
     """Create an empty draft and hand back its id and secret token.
 
     Called the moment onboarding starts, before the user has typed anything.
     The browser keeps the token and sends it back on every later update.
     """
-    return create_draft()
+    return await create_draft()
 
 
 @router.patch("/{draft_id}")
-def patch_draft(
+async def patch_draft(
     draft_id: str,
     body: DraftUpdate,
     x_draft_token: str = Header(...),
@@ -43,11 +43,16 @@ def patch_draft(
     the header is required; a request without it is rejected as a 422 before
     this function ever runs.
 
-    Handlers here are `def`, not `async def`, on purpose. psycopg is
-    synchronous, so the database call blocks. A plain `def` handler tells
-    FastAPI to run it in a threadpool, which keeps one slow query from
-    freezing every other request. An `async def` handler doing blocking work
-    would stall the whole event loop.
+    Handlers here are `async def`, like every handler in this codebase. The
+    database driver is asynchronous — psycopg's AsyncConnection, borrowed from
+    the pool in integrations/db.py — so the query suspends this request and
+    lets the worker serve others while Postgres thinks. A plain `def` handler
+    could not await it at all.
+
+    The rule that matters is the other half of that: nothing reachable from
+    here may call a *synchronous* driver. One `psycopg.connect()` or
+    `httpx.get()` blocks the event loop for its whole duration and freezes
+    every other request in the process.
     """
     # exclude_unset=True is load-bearing, not a detail. It narrows the model
     # down to only the fields this request actually sent. Without it, every
@@ -58,7 +63,7 @@ def patch_draft(
     if not fields:
         raise HTTPException(status_code=400, detail="nothing to update")
 
-    row = update_draft(draft_id, x_draft_token, fields)
+    row = await update_draft(draft_id, x_draft_token, fields)
 
     # The service returns None for "no such draft", "wrong token" and "already
     # claimed" alike. All three become the same 404 with the same message, so

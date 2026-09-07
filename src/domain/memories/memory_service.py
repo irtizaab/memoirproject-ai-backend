@@ -67,7 +67,7 @@ _MEMORY_COLUMNS = """
 """
 
 
-def _attach_assets(cur, memories: list[dict]) -> list[dict]:
+async def _attach_assets(cur, memories: list[dict]) -> list[dict]:
     """Hang each memory's media on it, with freshly signed URLs and transcripts.
 
     Three round trips regardless of how many memories there are: one query for
@@ -79,7 +79,7 @@ def _attach_assets(cur, memories: list[dict]) -> list[dict]:
         return memories
 
     ids = [m["id"] for m in memories]
-    cur.execute(
+    await cur.execute(
         """
         SELECT id, memory_id, kind::text AS kind, mime_type,
                byte_size, duration_ms, storage_path
@@ -90,17 +90,17 @@ def _attach_assets(cur, memories: list[dict]) -> list[dict]:
         """,
         {"ids": ids},
     )
-    assets = cur.fetchall()
+    assets = await cur.fetchall()
 
     # Sign every path in one call, then hand each asset its own URL. An asset
     # storage could not sign gets url=None and renders as a gap rather than
     # taking the page down.
-    signed = create_signed_download_urls([a["storage_path"] for a in assets])
+    signed = await create_signed_download_urls([a["storage_path"] for a in assets])
 
     # One more query, not one per asset. Only audio can have a transcript, so
     # a memoir of photographs asks for nothing.
     audio_ids = [a["id"] for a in assets if a["kind"] == "audio"]
-    transcripts = transcripts_for_assets(cur, audio_ids)
+    transcripts = await transcripts_for_assets(cur, audio_ids)
 
     by_memory: dict = {}
     for asset in assets:
@@ -114,7 +114,7 @@ def _attach_assets(cur, memories: list[dict]) -> list[dict]:
     return memories
 
 
-def _adopt_assets(cur, memoir_id: str, memory_id: str, asset_ids: list[str]) -> None:
+async def _adopt_assets(cur, memoir_id: str, memory_id: str, asset_ids: list[str]) -> None:
     """Point already-uploaded assets at the memory that now owns them.
 
     The `memoir_id` in the WHERE clause is the part that matters. Without it, a
@@ -128,7 +128,7 @@ def _adopt_assets(cur, memoir_id: str, memory_id: str, asset_ids: list[str]) -> 
     if not asset_ids:
         return
 
-    cur.execute(
+    await cur.execute(
         """
         UPDATE media_asset
            SET memory_id = %(memory_id)s
@@ -144,7 +144,7 @@ def _adopt_assets(cur, memoir_id: str, memory_id: str, asset_ids: list[str]) -> 
     )
 
 
-def _derive_kind(cur, memoir_id: str, asset_ids: list[str], body_text: str | None) -> str:
+async def _derive_kind(cur, memoir_id: str, asset_ids: list[str], body_text: str | None) -> str:
     """What kind of memory this is, worked out from what it actually holds.
 
     A memory is no longer *one* thing. Someone can attach three photographs, two
@@ -173,7 +173,7 @@ def _derive_kind(cur, memoir_id: str, asset_ids: list[str], body_text: str | Non
     kinds: set[str] = set()
 
     if asset_ids:
-        cur.execute(
+        await cur.execute(
             """
             SELECT DISTINCT kind::text AS kind
               FROM media_asset
@@ -183,7 +183,7 @@ def _derive_kind(cur, memoir_id: str, asset_ids: list[str], body_text: str | Non
             """,
             {"asset_ids": asset_ids, "memoir_id": memoir_id},
         )
-        kinds = {row["kind"] for row in cur.fetchall()}
+        kinds = {row["kind"] for row in await cur.fetchall()}
 
     if not kinds and not (body_text or "").strip():
         raise EmptyMemory
@@ -195,7 +195,7 @@ def _derive_kind(cur, memoir_id: str, asset_ids: list[str], body_text: str | Non
     return "text"
 
 
-def _rederive_kind(cur, memory_id: str) -> None:
+async def _rederive_kind(cur, memory_id: str) -> None:
     """Work out what a memory *is* again, after its contents changed.
 
     `_derive_kind` answers this once, at creation, from the assets being
@@ -213,15 +213,15 @@ def _rederive_kind(cur, memory_id: str) -> None:
     `_attach_assets` actually renders — a reservation that never became a file
     must not make this a photo memory.
     """
-    cur.execute(
+    await cur.execute(
         "SELECT body_text FROM memory WHERE id = %(memory_id)s",
         {"memory_id": memory_id},
     )
-    memory = cur.fetchone()
+    memory = await cur.fetchone()
     if memory is None:
         return
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT DISTINCT kind::text AS kind
           FROM media_asset
@@ -230,7 +230,7 @@ def _rederive_kind(cur, memory_id: str) -> None:
         """,
         {"memory_id": memory_id},
     )
-    kinds = {row["kind"] for row in cur.fetchall()}
+    kinds = {row["kind"] for row in await cur.fetchall()}
 
     if not kinds and not (memory["body_text"] or "").strip():
         raise EmptyMemory
@@ -242,7 +242,7 @@ def _rederive_kind(cur, memory_id: str) -> None:
     else:
         kind = "text"
 
-    cur.execute(
+    await cur.execute(
         """
         UPDATE memory
            SET kind = %(kind)s::memory_kind, updated_at = now()
@@ -252,14 +252,14 @@ def _rederive_kind(cur, memory_id: str) -> None:
     )
 
 
-def _select_memory(cur, memory_id: str) -> dict | None:
+async def _select_memory(cur, memory_id: str) -> dict | None:
     """One memory row with its contributor's name, by id.
 
     The read-back every write does before returning. Written once here because
     the two asset routes both need it; `get_memory` and `update_memory` predate
     it and inline the same query.
     """
-    cur.execute(
+    await cur.execute(
         f"""
         SELECT {_MEMORY_COLUMNS}
           FROM memory mem
@@ -269,15 +269,15 @@ def _select_memory(cur, memory_id: str) -> dict | None:
         """,
         {"memory_id": memory_id},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def _insert_memory(cur, memoir_id: str, participant_id: str, payload: dict) -> dict:
+async def _insert_memory(cur, memoir_id: str, participant_id: str, payload: dict) -> dict:
     """Write the row and read it back with its contributor's name."""
     asset_ids = payload.get("asset_ids") or []
-    kind = _derive_kind(cur, memoir_id, asset_ids, payload.get("body_text"))
+    kind = await _derive_kind(cur, memoir_id, asset_ids, payload.get("body_text"))
 
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO memory (memoir_id, participant_id, kind, title,
                             body_text, happened_on)
@@ -294,11 +294,11 @@ def _insert_memory(cur, memoir_id: str, participant_id: str, payload: dict) -> d
             "happened_on": payload.get("happened_on"),
         },
     )
-    memory_id = cur.fetchone()["id"]
+    memory_id = (await cur.fetchone())["id"]
 
-    _adopt_assets(cur, memoir_id, str(memory_id), asset_ids)
+    await _adopt_assets(cur, memoir_id, str(memory_id), asset_ids)
 
-    cur.execute(
+    await cur.execute(
         f"""
         SELECT {_MEMORY_COLUMNS}
           FROM memory mem
@@ -308,7 +308,7 @@ def _insert_memory(cur, memoir_id: str, participant_id: str, payload: dict) -> d
         """,
         {"memory_id": memory_id},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -316,18 +316,18 @@ def _insert_memory(cur, memoir_id: str, participant_id: str, payload: dict) -> d
 # ---------------------------------------------------------------------------
 
 
-def list_memories(memoir_id: str, user_id: str) -> list[dict] | None:
+async def list_memories(memoir_id: str, user_id: str) -> list[dict] | None:
     """Every memory in a memoir, newest first. None if it is not yours.
 
     Newest first because "Recent memories" on the archive means recently
     *added*, not most recently lived through. A memory of 1988 contributed this
     morning is news to the owner; one of 2002 added last year is not.
     """
-    with db() as conn, conn.cursor() as cur:
-        if owned_memoir(cur, memoir_id, user_id) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await owned_memoir(cur, memoir_id, user_id) is None:
             return None
 
-        cur.execute(
+        await cur.execute(
             f"""
             SELECT {_MEMORY_COLUMNS}
               FROM memory mem
@@ -338,10 +338,10 @@ def list_memories(memoir_id: str, user_id: str) -> list[dict] | None:
             """,
             {"memoir_id": memoir_id},
         )
-        return _attach_assets(cur, cur.fetchall())
+        return await _attach_assets(cur, await cur.fetchall())
 
 
-def get_memory(memory_id: str, user_id: str) -> dict | None:
+async def get_memory(memory_id: str, user_id: str) -> dict | None:
     """One memory in full, or None if it is not yours.
 
     The archive list already carries everything this returns, so the detail page
@@ -353,11 +353,11 @@ def get_memory(memory_id: str, user_id: str) -> dict | None:
     `DELETE` use, so "not yours" and "does not exist" are one answer here for the
     same reason they are there.
     """
-    with db() as conn, conn.cursor() as cur:
-        if owned_memoir_of_memory(cur, memory_id, user_id) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await owned_memoir_of_memory(cur, memory_id, user_id) is None:
             return None
 
-        cur.execute(
+        await cur.execute(
             f"""
             SELECT {_MEMORY_COLUMNS}
               FROM memory mem
@@ -367,35 +367,35 @@ def get_memory(memory_id: str, user_id: str) -> dict | None:
             """,
             {"memory_id": memory_id},
         )
-        memory = cur.fetchone()
+        memory = await cur.fetchone()
         if memory is None:
             return None
 
-        return _attach_assets(cur, [memory])[0]
+        return (await _attach_assets(cur, [memory]))[0]
 
 
-def create_memory(memoir_id: str, user_id: str, payload: dict) -> dict | None:
+async def create_memory(memoir_id: str, user_id: str, payload: dict) -> dict | None:
     """Record a memory the owner wrote themselves.
 
     The owner is a participant in their own memoir — the claim step created
     their `owner` row — so this attributes to that row rather than inventing a
     second identity for them.
     """
-    with db() as conn, conn.cursor() as cur:
-        memoir = owned_memoir(cur, memoir_id, user_id)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir(cur, memoir_id, user_id)
         if memoir is None:
             return None
         if memoir["status"] == "published":
             raise MemoirPublished
 
-        cur.execute(
+        await cur.execute(
             """
             SELECT id FROM memoir_participant
              WHERE memoir_id = %(memoir_id)s AND role = 'owner'
             """,
             {"memoir_id": memoir_id},
         )
-        owner = cur.fetchone()
+        owner = await cur.fetchone()
         if owner is None:
             # A memoir with no owner row should be impossible: the claim
             # transaction creates both together, and the partial unique index
@@ -403,11 +403,11 @@ def create_memory(memoir_id: str, user_id: str, payload: dict) -> dict | None:
             logger.error("Memoir %s has no owner participant", memoir_id)
             return None
 
-        memory = _insert_memory(cur, memoir_id, str(owner["id"]), payload)
-        return _attach_assets(cur, [memory])[0]
+        memory = await _insert_memory(cur, memoir_id, str(owner["id"]), payload)
+        return (await _attach_assets(cur, [memory]))[0]
 
 
-def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
+async def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
     """Edit a memory. None if it is not yours or does not exist.
 
     `fields` has already been through `exclude_unset=True`, so an absent key
@@ -417,8 +417,8 @@ def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
     if not fields:
         return None
 
-    with db() as conn, conn.cursor() as cur:
-        memoir = owned_memoir_of_memory(cur, memory_id, user_id)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir_of_memory(cur, memory_id, user_id)
         if memoir is None:
             return None
         if memoir["status"] == "published":
@@ -436,7 +436,7 @@ def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
         params = {column: fields[column] for column in columns}
         params["memory_id"] = memory_id
 
-        cur.execute(
+        await cur.execute(
             f"""
             UPDATE memory mem
                SET {assignments}, updated_at = now()
@@ -448,7 +448,7 @@ def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
             """,
             params,
         )
-        if cur.fetchone() is None:
+        if await cur.fetchone() is None:
             return None
 
         # Clearing the words off a memory that holds nothing else would leave
@@ -459,13 +459,13 @@ def update_memory(memory_id: str, user_id: str, fields: dict) -> dict | None:
         #
         # This also keeps `kind` honest: it is read back below rather than
         # taken from the RETURNING above, which still carried the old value.
-        _rederive_kind(cur, memory_id)
+        await _rederive_kind(cur, memory_id)
 
-        memory = _select_memory(cur, memory_id)
-        return _attach_assets(cur, [memory])[0] if memory else None
+        memory = await _select_memory(cur, memory_id)
+        return (await _attach_assets(cur, [memory]))[0] if memory else None
 
 
-def delete_memory(memory_id: str, user_id: str) -> bool:
+async def delete_memory(memory_id: str, user_id: str) -> bool:
     """Remove a memory and the objects it held. False if it was not yours.
 
     The database row goes first, inside the transaction; the storage objects
@@ -474,29 +474,29 @@ def delete_memory(memory_id: str, user_id: str) -> bool:
     cost of an orphaned file. The reverse order risks a file deleted out from
     under a memory that is still on the page.
     """
-    with db() as conn, conn.cursor() as cur:
-        memoir = owned_memoir_of_memory(cur, memory_id, user_id)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir_of_memory(cur, memory_id, user_id)
         if memoir is None:
             return False
         if memoir["status"] == "published":
             raise MemoirPublished
 
         # Read the paths before the cascade takes the rows with it.
-        cur.execute(
+        await cur.execute(
             "SELECT storage_path FROM media_asset WHERE memory_id = %(id)s",
             {"id": memory_id},
         )
-        paths = [row["storage_path"] for row in cur.fetchall()]
+        paths = [row["storage_path"] for row in await cur.fetchall()]
 
-        cur.execute("DELETE FROM memory WHERE id = %(id)s", {"id": memory_id})
+        await cur.execute("DELETE FROM memory WHERE id = %(id)s", {"id": memory_id})
 
     for path in paths:
-        delete_object(path)
+        await delete_object(path)
 
     return True
 
 
-def attach_assets(memory_id: str, user_id: str, asset_ids: list[str]) -> dict | None:
+async def attach_assets(memory_id: str, user_id: str, asset_ids: list[str]) -> dict | None:
     """Add already-uploaded files to a memory that exists. None if not yours.
 
     The editing half of what `create_memory` does in one go. The upload still
@@ -511,21 +511,21 @@ def attach_assets(memory_id: str, user_id: str, asset_ids: list[str]) -> dict | 
     if not asset_ids:
         return None
 
-    with db() as conn, conn.cursor() as cur:
-        memoir = owned_memoir_of_memory(cur, memory_id, user_id)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir_of_memory(cur, memory_id, user_id)
         if memoir is None:
             return None
         if memoir["status"] == "published":
             raise MemoirPublished
 
-        _adopt_assets(cur, str(memoir["id"]), memory_id, asset_ids)
-        _rederive_kind(cur, memory_id)
+        await _adopt_assets(cur, str(memoir["id"]), memory_id, asset_ids)
+        await _rederive_kind(cur, memory_id)
 
-        memory = _select_memory(cur, memory_id)
-        return _attach_assets(cur, [memory])[0] if memory else None
+        memory = await _select_memory(cur, memory_id)
+        return (await _attach_assets(cur, [memory]))[0] if memory else None
 
 
-def remove_asset(memory_id: str, user_id: str, asset_id: str) -> dict | None:
+async def remove_asset(memory_id: str, user_id: str, asset_id: str) -> dict | None:
     """Take one photograph or recording off a memory, and delete the file.
 
     None if the memory is not yours, or if that asset is not on it.
@@ -545,8 +545,8 @@ def remove_asset(memory_id: str, user_id: str, asset_id: str) -> dict | None:
     the whole transaction rolls back, so the file is still attached and still
     in storage. Nothing is deleted by a request that gets a 400.
     """
-    with db() as conn, conn.cursor() as cur:
-        memoir = owned_memoir_of_memory(cur, memory_id, user_id)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir_of_memory(cur, memory_id, user_id)
         if memoir is None:
             return None
         if memoir["status"] == "published":
@@ -554,7 +554,7 @@ def remove_asset(memory_id: str, user_id: str, asset_id: str) -> dict | None:
 
         # `memory_id` in the WHERE is what stops an asset id from another
         # memory being deleted through a memory the caller does own.
-        cur.execute(
+        await cur.execute(
             """
             DELETE FROM media_asset
              WHERE id = %(asset_id)s
@@ -563,29 +563,29 @@ def remove_asset(memory_id: str, user_id: str, asset_id: str) -> dict | None:
             """,
             {"asset_id": asset_id, "memory_id": memory_id},
         )
-        removed = cur.fetchone()
+        removed = await cur.fetchone()
         if removed is None:
             return None
 
-        _rederive_kind(cur, memory_id)
+        await _rederive_kind(cur, memory_id)
 
-        memory = _select_memory(cur, memory_id)
-        memory = _attach_assets(cur, [memory])[0] if memory else None
+        memory = await _select_memory(cur, memory_id)
+        memory = (await _attach_assets(cur, [memory]))[0] if memory else None
         storage_path = removed["storage_path"]
 
-    delete_object(storage_path)
+    await delete_object(storage_path)
     return memory
 
 
-def storage_used_bytes(user_id: str) -> int:
+async def storage_used_bytes(user_id: str) -> int:
     """Total confirmed bytes across every memoir this user owns.
 
     Counts `uploaded_at IS NOT NULL` only, so a reservation that never became a
     file is not charged to anyone. COALESCE because SUM over no rows is NULL,
     and a brand-new account should read 0, not null.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT COALESCE(SUM(a.byte_size), 0) AS used
               FROM media_asset a
@@ -595,7 +595,7 @@ def storage_used_bytes(user_id: str) -> int:
             """,
             {"user_id": user_id},
         )
-        return int(cur.fetchone()["used"])
+        return int((await cur.fetchone())["used"])
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +603,7 @@ def storage_used_bytes(user_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def contribute_memory(link_token: str, payload: dict) -> dict | None:
+async def contribute_memory(link_token: str, payload: dict) -> dict | None:
     """Record a memory from someone with no account.
 
     Returns the memory plus the participant token that identifies them next
@@ -615,21 +615,21 @@ def contribute_memory(link_token: str, payload: dict) -> dict | None:
     a name in the contributors list belonging to someone who never managed to
     contribute anything.
     """
-    with db() as conn, conn.cursor() as cur:
-        memoir = contributable_memoir(cur, link_token)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await contributable_memoir(cur, link_token)
         if memoir is None:
             return None
 
         memoir_id = str(memoir["id"])
-        participant = resolve_participant(
+        participant = await resolve_participant(
             cur,
             memoir_id=memoir_id,
             token=payload.get("participant_token"),
             display_name=payload["display_name"],
         )
 
-        memory = _insert_memory(cur, memoir_id, str(participant["id"]), payload)
-        memory = _attach_assets(cur, [memory])[0]
+        memory = await _insert_memory(cur, memoir_id, str(participant["id"]), payload)
+        memory = (await _attach_assets(cur, [memory]))[0]
 
         return {
             "memory": memory,
@@ -637,7 +637,7 @@ def contribute_memory(link_token: str, payload: dict) -> dict | None:
         }
 
 
-def resolve_participant(
+async def resolve_participant(
     cur, memoir_id: str, token: str | None, display_name: str
 ) -> dict:
     """Find the returning contributor, or create a new one.
@@ -684,7 +684,7 @@ def resolve_participant(
     rather than deleting it. See `migrations/0010_contributor_merge.sql`.
     """
     if token:
-        cur.execute(
+        await cur.execute(
             """
             SELECT COALESCE(merged_into, id) AS id, contributor_token
               FROM memoir_participant
@@ -694,14 +694,14 @@ def resolve_participant(
             """,
             {"memoir_id": memoir_id, "token": token},
         )
-        existing = cur.fetchone()
+        existing = await cur.fetchone()
         if existing is not None:
             wanted = display_name.strip()
             if wanted:
                 # Guarded on the name actually differing, so the ordinary case
                 # — somebody adding a third memory in one sitting — is a read
                 # and not a write.
-                cur.execute(
+                await cur.execute(
                     """
                     UPDATE memoir_participant
                        SET display_name = %(display_name)s
@@ -719,7 +719,7 @@ def resolve_participant(
 
         logger.info("Contributor token did not match; treating as a new person")
 
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO memoir_participant
             (memoir_id, role, display_name, relationship,
@@ -731,10 +731,10 @@ def resolve_participant(
         """,
         {"memoir_id": memoir_id, "display_name": display_name.strip()},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def list_contributions(link_token: str, participant_token: str) -> list[dict] | None:
+async def list_contributions(link_token: str, participant_token: str) -> list[dict] | None:
     """What one contributor has added, for their own review.
 
     Scoped to their participant row and nothing else. A contributor may see
@@ -742,12 +742,12 @@ def list_contributions(link_token: str, participant_token: str) -> list[dict] | 
     the contributor screen promises exactly that, and this query is where the
     promise is kept.
     """
-    with db() as conn, conn.cursor() as cur:
-        memoir = contributable_memoir(cur, link_token)
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await contributable_memoir(cur, link_token)
         if memoir is None:
             return None
 
-        cur.execute(
+        await cur.execute(
             f"""
             SELECT {_MEMORY_COLUMNS}
               FROM memory mem
@@ -759,4 +759,4 @@ def list_contributions(link_token: str, participant_token: str) -> list[dict] | 
             """,
             {"memoir_id": str(memoir["id"]), "token": participant_token},
         )
-        return _attach_assets(cur, cur.fetchall())
+        return await _attach_assets(cur, await cur.fetchall())

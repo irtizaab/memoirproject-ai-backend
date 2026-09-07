@@ -391,6 +391,13 @@ class FakeStorage:
     network: reserve, PUT, confirm. `objects` maps a storage path to bytes, so a
     test can assert a file was really deleted rather than that a function was
     called.
+
+    The five methods that replace `supabase_storage` functions are `async def`,
+    because the functions they stand in for are. A synchronous double here
+    fails as `object bool can't be used in 'await' expression` deep inside a
+    domain service, which reads like a bug in the code under test rather than
+    in the fake. `put()` is the exception: it stands in for the browser, not
+    for a wrapper, and no production code awaits it.
     """
 
     def __init__(self):
@@ -398,17 +405,17 @@ class FakeStorage:
         self.signed_uploads: list[str] = []
         self.deleted: list[str] = []
 
-    def create_signed_upload_url(self, path: str) -> str:
+    async def create_signed_upload_url(self, path: str) -> str:
         self.signed_uploads.append(path)
         return f"https://storage.test/upload/{path}"
 
-    def create_signed_download_url(self, path: str) -> str:
+    async def create_signed_download_url(self, path: str) -> str:
         return f"https://storage.test/read/{path}"
 
-    def create_signed_download_urls(self, paths: list[str]) -> dict[str, str]:
+    async def create_signed_download_urls(self, paths: list[str]) -> dict[str, str]:
         return {p: f"https://storage.test/read/{p}" for p in paths}
 
-    def object_size(self, path: str) -> int:
+    async def object_size(self, path: str) -> int:
         from src.integrations.supabase_storage import StorageError
 
         if path not in self.objects:
@@ -417,7 +424,7 @@ class FakeStorage:
             raise StorageError(f"no object at {path}")
         return len(self.objects[path])
 
-    def delete_object(self, path: str) -> None:
+    async def delete_object(self, path: str) -> None:
         self.deleted.append(path)
         self.objects.pop(path, None)
 
@@ -467,8 +474,11 @@ def _no_transcription(monkeypatch):
     by simply uploading a recording, which is what `POST /media/uploads/{id}/
     complete` does in production.
     """
+    async def _do_nothing(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(
-        "src.api.media.request_transcription", lambda *a, **k: None, raising=False
+        "src.api.media.request_transcription", _do_nothing, raising=False
     )
 
 

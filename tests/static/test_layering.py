@@ -17,38 +17,17 @@ import pytest
 
 SRC = Path(__file__).resolve().parent.parent.parent / "src"
 
-# The leftover template scaffolding, excluded from every rule below.
-#
-# `AGENTS.md` says it plainly: "The `example_*` files alongside these are
-# leftover template scaffolding, kept as a reference. They are not wired into
-# the app." It also says that where they disagree with the real code, the real
-# code wins — and they do disagree, on two counts. `api/example.py` is an
-# `async def` handler and swallows every exception into a 500 carrying the raw
-# error text. Both are exactly what the house rules forbid.
-#
-# So they are held apart rather than allowed to weaken the rules, and
-# `test_example_scaffolding_is_not_wired_in` proves they stay unreachable. The
-# real fix is deleting them; this set is what makes that a one-line change here.
-EXAMPLE_SCAFFOLDING = {
-    "api/example.py",
-    "domain/example_feature/constants.py",
-    "domain/example_feature/example_service.py",
-    "domain/example_feature/utils.py",
-    "models/example_models.py",
-    "integrations/llm_client.py",
-    "utils/string_helpers.py",
-}
-
-
 def python_files(*subdirs: str) -> list[Path]:
-    """Every real source file. Template scaffolding is never included."""
+    """Every source file. There is nothing under src/ these rules do not cover.
+
+    There used to be an exclusion list here for the template scaffolding the
+    project was generated from — `api/example.py` and friends, which broke two
+    of the rules below and were held apart rather than allowed to weaken them.
+    Those files are gone, so the honest version of this function is the one
+    with no exceptions in it.
+    """
     roots = [SRC / d for d in subdirs] if subdirs else [SRC]
-    return sorted(
-        p
-        for root in roots
-        for p in root.rglob("*.py")
-        if p.relative_to(SRC).as_posix() not in EXAMPLE_SCAFFOLDING
-    )
+    return sorted(p for root in roots for p in root.rglob("*.py"))
 
 
 def code_lines(path: Path) -> list[tuple[int, str]]:
@@ -180,31 +159,6 @@ def test_integrations_layer_knows_nothing_about_memoirs():
     )
 
 
-def test_example_scaffolding_is_not_wired_in():
-    """The template leftovers stay unreachable.
-
-    `api/example.py` is an anti-example — an `async def` handler that catches
-    every exception and returns the raw error text as a 500. It is excluded from
-    the house rules above on the grounds that nothing can reach it, so that
-    exclusion is only honest while it stays true.
-
-    Two things are asserted: `main.py` never registers the router, and the app
-    really has no such path.
-    """
-    main = (SRC / "main.py").read_text(encoding="utf-8")
-    assert "example" not in main, (
-        "src/api/example.py has been wired into main.py — it breaks two house "
-        "rules, so either fix it or take it back out"
-    )
-
-    from src.main import app
-
-    # Read from the OpenAPI schema rather than `app.routes`: this FastAPI
-    # version keeps included routers nested, so the flat list does not carry
-    # their paths.
-    assert "/example/greet" not in app.openapi()["paths"]
-
-
 # ---------------------------------------------------------------------------
 # Wiring stays in main.py
 # ---------------------------------------------------------------------------
@@ -284,36 +238,38 @@ def test_no_blanket_exception_handlers():
 
 
 # ---------------------------------------------------------------------------
-# Every route handler is a plain `def`
+# Every route handler is `async def`, and nothing under src/ blocks the loop
 # ---------------------------------------------------------------------------
-
-# `webhooks.post_assemblyai` is `async def` and awaits `request.json()`.
 #
-# Its own docstring claims there is no blocking database call on that path.
-# There is: `apply_result` reaches `db()`, and can reach `fetch()`, both of
-# which are synchronous. So this one handler does briefly block the event loop.
-# Recorded here rather than quietly allowed — see the note in the test below.
-KNOWN_ASYNC_HANDLERS = {("api/webhooks.py", "post_assemblyai")}
+# These two tests are a pair, and neither is much use alone.
+#
+# The driver stack is asynchronous: psycopg's AsyncConnection through the pool
+# in integrations/db.py, and one shared httpx.AsyncClient in integrations/http.py.
+# Given that, a handler written as a plain `def` is run in a threadpool, where
+# it cannot await anything it needs — so the first test insists on `async def`.
+#
+# The second is the one that actually protects the process. A single
+# synchronous driver call reintroduced anywhere under src/ — `psycopg.connect`,
+# `httpx.get`, an `httpx.Client` — blocks the event loop for its whole
+# duration, and with it every other request the worker is serving. That
+# regression produces no error and no failing test of its own; the only symptom
+# is a server that gets mysteriously slow under load. This is where it gets
+# caught.
 
 
-def test_route_handlers_are_sync_because_psycopg_is():
-    """`def`, not `async def` — the decision this whole backend rests on.
+def test_route_handlers_are_async():
+    """`async def`, not `def` — the decision this whole backend rests on.
 
-    psycopg is synchronous. FastAPI runs an `async def` handler *on the event
-    loop*, so a blocking query inside one freezes every other request in the
-    process; a plain `def` handler is run in a threadpool instead, where
-    blocking harms nobody.
-
-    The wrong version is the one that looks more modern, it produces no error,
-    and the only symptom is a server that gets mysteriously slow under load.
-    That is exactly the kind of regression a test should catch.
+    The database driver and the HTTP client are both asynchronous, so a
+    handler has to be able to await them. A plain `def` handler cannot: FastAPI
+    hands it to a threadpool with no running loop underneath it.
     """
     offenders = []
     for path in python_files("api"):
         relative = path.relative_to(SRC).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef):
+            if not isinstance(node, ast.FunctionDef):
                 continue
             is_route = any(
                 isinstance(d, ast.Call)
@@ -321,23 +277,59 @@ def test_route_handlers_are_sync_because_psycopg_is():
                 and d.func.attr in {"get", "post", "patch", "put", "delete"}
                 for d in node.decorator_list
             )
-            if is_route and (relative, node.name) not in KNOWN_ASYNC_HANDLERS:
+            if is_route:
                 offenders.append(f"{relative}:{node.lineno} {node.name}")
 
     assert offenders == [], (
-        "async route handlers with a synchronous driver:\n" + "\n".join(offenders)
+        "route handlers that are not `async def`:\n" + "\n".join(offenders)
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Known issue. post_assemblyai is `async def` but apply_result() reaches "
-        "db() and httpx, both synchronous — so it blocks the event loop, which "
-        "is the exact thing every other handler avoids. Low traffic, harmless "
-        "today. The fix is making it a plain `def`; this xfail turns green and "
-        "should then be deleted along with KNOWN_ASYNC_HANDLERS."
-    ),
-    strict=True,
-)
-def test_the_webhook_handler_should_also_be_sync():
-    assert KNOWN_ASYNC_HANDLERS == set()
+# The synchronous driver calls that must never reappear under src/.
+#
+# `httpx.AsyncClient` is deliberately absent: constructing one is fine, and
+# integrations/http.py does exactly that. It is the *synchronous* Client and
+# the module-level shorthands that block.
+BLOCKING_CALLS = {
+    ("psycopg", "connect"),
+    ("httpx", "Client"),
+    ("httpx", "get"),
+    ("httpx", "post"),
+    ("httpx", "put"),
+    ("httpx", "patch"),
+    ("httpx", "head"),
+    ("httpx", "delete"),
+    ("httpx", "request"),
+    ("httpx", "stream"),
+}
+
+
+def test_no_blocking_io_in_src():
+    """No synchronous driver call anywhere the event loop can reach it.
+
+    One of these is enough to stall every request in the worker for as long as
+    it runs. The failure mode is latency under concurrency, not an exception,
+    so nothing else in this suite would notice.
+
+    The fix when this fails is never to make the caller a plain `def`: it is
+    `async with db()` for the database, and `await (await client()).get(...)`
+    for HTTP.
+    """
+    offenders = []
+    for path in python_files():
+        relative = path.relative_to(SRC).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+                continue
+            if (func.value.id, func.attr) in BLOCKING_CALLS:
+                offenders.append(
+                    f"{relative}:{node.lineno} {func.value.id}.{func.attr}()"
+                )
+
+    assert offenders == [], (
+        "synchronous driver calls on the event loop:\n" + "\n".join(offenders)
+    )

@@ -15,6 +15,11 @@
 pytest==8.4.2
 pytest-cov==7.0.0
 
+# The suite drives an async app, and a handful of tests call a domain
+# function directly. `asyncio_mode = auto` in pytest.ini is what lets those be
+# plain `async def test_...` with no decorator.
+pytest-asyncio==1.2.0
+
 # Stubs httpx at the transport layer, so `integrations/assemblyai.py` and
 # `integrations/supabase_storage.py` can be exercised as written rather than
 # monkeypatched away. Nothing in the suite reaches the network.

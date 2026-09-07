@@ -81,7 +81,7 @@ def _extension_for(kind: str, mime_type: str) -> str:
     return table[base]
 
 
-def _authorize(cur, memoir_id: str, user_id: str | None, link_token: str | None):
+async def _authorize(cur, memoir_id: str, user_id: str | None, link_token: str | None):
     """Resolve whichever credential was supplied into a memoir, or None.
 
     Both paths end at the same place, which is the point: an upload is allowed
@@ -89,10 +89,10 @@ def _authorize(cur, memoir_id: str, user_id: str | None, link_token: str | None)
     caller does not get to say which — it supplies what it has.
     """
     if user_id is not None:
-        return owned_memoir(cur, memoir_id, user_id)
+        return await owned_memoir(cur, memoir_id, user_id)
 
     if link_token is not None:
-        memoir = contributable_memoir(cur, link_token)
+        memoir = await contributable_memoir(cur, link_token)
         # The link has to point at the memoir being written to. Without this
         # check, a valid link to memoir A would authorize an upload into B.
         if memoir is not None and str(memoir["id"]) == memoir_id:
@@ -101,7 +101,7 @@ def _authorize(cur, memoir_id: str, user_id: str | None, link_token: str | None)
     return None
 
 
-def begin_upload(
+async def begin_upload(
     memoir_id: str,
     kind: str,
     mime_type: str,
@@ -123,11 +123,11 @@ def begin_upload(
     extension = _extension_for(kind, mime_type)
     storage_path = f"{memoir_id}/{uuid.uuid4().hex}.{extension}"
 
-    with db() as conn, conn.cursor() as cur:
-        if _authorize(cur, memoir_id, user_id, link_token) is None:
+    async with db() as conn, conn.cursor() as cur:
+        if await _authorize(cur, memoir_id, user_id, link_token) is None:
             return None
 
-        cur.execute(
+        await cur.execute(
             """
             INSERT INTO media_asset
                 (memoir_id, kind, storage_path, mime_type,
@@ -146,19 +146,19 @@ def begin_upload(
                 "duration_ms": duration_ms if kind == "audio" else None,
             },
         )
-        asset_id = cur.fetchone()["id"]
+        asset_id = (await cur.fetchone())["id"]
 
     # Signed outside the transaction on purpose. It is a network call to
     # another service, and holding a Postgres transaction open across one ties
     # up a connection for as long as Supabase takes to answer. If it fails, the
     # reservation row is orphaned — harmless, uncounted, and swept up by the
     # cleanup job noted at the end of migration 0003.
-    upload_url = create_signed_upload_url(storage_path)
+    upload_url = await create_signed_upload_url(storage_path)
 
     return {"asset_id": asset_id, "upload_url": upload_url}
 
 
-def complete_upload(
+async def complete_upload(
     asset_id: str,
     user_id: str | None = None,
     link_token: str | None = None,
@@ -172,8 +172,8 @@ def complete_upload(
     Raises UploadNotConfirmed when storage has nothing at the path, which is
     the honest answer when a PUT silently failed.
     """
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             SELECT id, memoir_id, storage_path, uploaded_at
               FROM media_asset
@@ -181,18 +181,18 @@ def complete_upload(
             """,
             {"asset_id": asset_id},
         )
-        asset = cur.fetchone()
+        asset = await cur.fetchone()
         if asset is None:
             return None
 
-        if _authorize(cur, str(asset["memoir_id"]), user_id, link_token) is None:
+        if await _authorize(cur, str(asset["memoir_id"]), user_id, link_token) is None:
             return None
 
     # Outside the transaction again, for the same reason as above.
-    size = object_size(asset["storage_path"])
+    size = await object_size(asset["storage_path"])
 
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
+    async with db() as conn, conn.cursor() as cur:
+        await cur.execute(
             """
             UPDATE media_asset
                SET uploaded_at = COALESCE(uploaded_at, now()),
@@ -202,7 +202,7 @@ def complete_upload(
             """,
             {"asset_id": asset_id, "size": size},
         )
-        confirmed = cur.fetchone()
+        confirmed = await cur.fetchone()
 
     # `url` is absent rather than signed here: nothing displays an asset at the
     # moment it is confirmed. The memory it gets attached to signs it when the

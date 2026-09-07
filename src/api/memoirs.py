@@ -24,7 +24,7 @@ router = APIRouter(prefix="/memoirs", tags=["memoirs"])
 
 
 @router.post("/claim", response_model=MemoirSummary, status_code=201)
-def post_claim(
+async def post_claim(
     body: ClaimRequest,
     x_draft_token: str = Header(..., description="token from POST /drafts"),
     user: CurrentUser = Depends(current_user),
@@ -50,7 +50,7 @@ def post_claim(
     will be for this draft.
     """
     try:
-        memoir = claim_draft(
+        memoir = await claim_draft(
             draft_id=str(body.draft_id),
             draft_token=x_draft_token,
             user_id=user.id,

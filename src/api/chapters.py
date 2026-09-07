@@ -64,7 +64,7 @@ def _either(user_id: str | None, link_token: str | None) -> None:
 
 
 @router.get("/r/{token}", response_model=MemoirReading)
-def get_reading(token: str):
+async def get_reading(token: str):
     """Resolve a view link into the book it opens.
 
     `/r/` for read, beside `/j/` for join. Short for the same reason: this URL
@@ -80,7 +80,7 @@ def get_reading(token: str):
     `never_forget` answer away from anyone the link was forwarded to — the same
     reasoning as `LinkInvitation` on `GET /j/{token}`.
     """
-    reading = reading_for_link(token)
+    reading = await reading_for_link(token)
 
     # Unknown, revoked and wrong-scope look identical from out here, on purpose.
     if reading is None:
@@ -90,14 +90,14 @@ def get_reading(token: str):
 
 
 @router.get("/memoirs/{memoir_id}/chapters", response_model=MemoirReading)
-def get_owner_reading(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+async def get_owner_reading(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
     """The same covers, for the owner reading their own memoir.
 
     Exists so an owner can read before publishing, and without a view link
     having been issued. 404 rather than 403 for a memoir that is not theirs —
     this API never confirms a stranger's memoir exists.
     """
-    reading = reading_for_owner(str(memoir_id), user.id)
+    reading = await reading_for_owner(str(memoir_id), user.id)
     if reading is None:
         raise HTTPException(status_code=404, detail="memoir not found")
     return reading
@@ -109,7 +109,7 @@ def get_owner_reading(memoir_id: UUID, user: CurrentUser = Depends(current_user)
 
 
 @router.get("/chapters/{chapter_id}", response_model=Chapter)
-def get_one_chapter(
+async def get_one_chapter(
     chapter_id: UUID,
     user_id: str | None = Depends(optional_user_id),
     x_link_token: str | None = Header(
@@ -123,7 +123,7 @@ def get_one_chapter(
     """
     _either(user_id, x_link_token)
 
-    chapter = get_chapter(
+    chapter = await get_chapter(
         str(chapter_id), user_id=user_id, link_token=x_link_token
     )
     if chapter is None:
@@ -137,7 +137,7 @@ def get_one_chapter(
 
 
 @router.get("/chapters/{chapter_id}/comments", response_model=list[CommentThread])
-def get_comments(
+async def get_comments(
     chapter_id: UUID,
     user_id: str | None = Depends(optional_user_id),
     x_link_token: str | None = Header(
@@ -153,7 +153,7 @@ def get_comments(
     """
     _either(user_id, x_link_token)
 
-    threads = list_threads(
+    threads = await list_threads(
         str(chapter_id), user_id=user_id, link_token=x_link_token
     )
     if threads is None:
@@ -164,7 +164,7 @@ def get_comments(
 @router.post(
     "/chapters/{chapter_id}/comments", response_model=CommentReceipt, status_code=201
 )
-def post_comment(
+async def post_comment(
     chapter_id: UUID,
     body: CommentCreate,
     user_id: str | None = Depends(optional_user_id),
@@ -190,7 +190,7 @@ def post_comment(
     _either(user_id, x_link_token)
 
     try:
-        receipt = add_comment(
+        receipt = await add_comment(
             str(chapter_id),
             body.model_dump(),
             user_id=user_id,

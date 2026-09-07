@@ -27,7 +27,7 @@ class DevSignin(BaseModel):
 
 
 @router.post("/signin")
-def post_dev_signin(body: DevSignin):
+async def post_dev_signin(body: DevSignin):
     """Create or sign in a test user and return a real access token.
 
     Exists because there is a chicken-and-egg problem while building: every
@@ -44,7 +44,7 @@ def post_dev_signin(body: DevSignin):
     a password. That is why this route is off by default.
     """
     try:
-        session = password_signin(body.email, body.password)
+        session = await password_signin(body.email, body.password)
     except TokenError as exc:
         # 502, not 500: the failure is upstream at Supabase, not in this app.
         # Most often "Email not confirmed", which means email confirmation is

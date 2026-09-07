@@ -1,0 +1,20 @@
+# Keep the build context to what the image actually runs.
+#
+# This is not only about image size. `.env` holds the service role key, and a
+# COPY that swept it into a layer would put a secret inside every copy of the
+# image, where deleting it later does not help — the layer keeps it.
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+requirements-dev.txt
+pytest.ini
+*.md
+*.html
+.git/
+.venv/
+venv/

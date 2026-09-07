@@ -13,7 +13,7 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-def health():
+async def health():
     """Report whether the API can reach the database.
 
     Note this route calls integrations/ directly, skipping domain/ — the one
@@ -25,4 +25,4 @@ def health():
     which is what a health check is supposed to do. Do not wrap it in a
     try/except that reports "ok" anyway.
     """
-    return {"status": "ok", "database": ping()}
+    return {"status": "ok", "database": await ping()}

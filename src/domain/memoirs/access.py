@@ -21,13 +21,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def owned_memoir(cur, memoir_id: str, user_id: str) -> dict | None:
+async def owned_memoir(cur, memoir_id: str, user_id: str) -> dict | None:
     """The memoir, if this user owns it. None otherwise.
 
     Returns `status` too, because almost every caller needs to know whether the
     memoir is published before it writes.
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT id, subject_name, status::text AS status
           FROM memoir
@@ -36,16 +36,16 @@ def owned_memoir(cur, memoir_id: str, user_id: str) -> dict | None:
         """,
         {"memoir_id": memoir_id, "user_id": user_id},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def owned_memoir_of_memory(cur, memory_id: str, user_id: str) -> dict | None:
+async def owned_memoir_of_memory(cur, memory_id: str, user_id: str) -> dict | None:
     """The memoir a memory belongs to, if this user owns it.
 
     The edit and delete routes are addressed by memory id alone — `/memories/
     {id}` — so ownership has to be reached by joining back up to the memoir.
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT m.id, m.status::text AS status
           FROM memory mem
@@ -55,10 +55,10 @@ def owned_memoir_of_memory(cur, memory_id: str, user_id: str) -> dict | None:
         """,
         {"memory_id": memory_id, "user_id": user_id},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def contributable_memoir(cur, link_token: str) -> dict | None:
+async def contributable_memoir(cur, link_token: str) -> dict | None:
     """The memoir a live contribute link points at. None if it cannot be used.
 
     Four things have to hold, and failing any of them looks identical from
@@ -77,7 +77,7 @@ def contributable_memoir(cur, link_token: str) -> dict | None:
     link for display, in `domain/links/`; counting a submission as an open
     would inflate the number the owner reads as "how many people looked".
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT m.id, m.status::text AS status
           FROM memoir_link l
@@ -89,10 +89,10 @@ def contributable_memoir(cur, link_token: str) -> dict | None:
         """,
         {"token": link_token},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
 
 
-def readable_memoir(cur, link_token: str) -> dict | None:
+async def readable_memoir(cur, link_token: str) -> dict | None:
     """The memoir a live **view** link points at. None if it cannot be used.
 
     The read-side twin of `contributable_memoir`, and deliberately not the same
@@ -114,7 +114,7 @@ def readable_memoir(cur, link_token: str) -> dict | None:
     API layer turns that into 404. Unknown, revoked and wrong-scope all look
     identical from outside, which is the point.
     """
-    cur.execute(
+    await cur.execute(
         """
         SELECT m.id, m.subject_name, m.born_year, m.through_year,
                m.subject_is_living, m.published_at, m.status::text AS status
@@ -126,4 +126,4 @@ def readable_memoir(cur, link_token: str) -> dict | None:
         """,
         {"token": link_token},
     )
-    return cur.fetchone()
+    return await cur.fetchone()
