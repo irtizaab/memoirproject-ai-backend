@@ -263,6 +263,10 @@ async def list_memoirs_for_owner(user_id: str) -> list[dict]:
 
     The join is filtered to live contribute links only - `revoked_at IS NULL` -
     so a dead token is never handed back to be shared.
+
+    `chapter_count` is a correlated subquery rather than a third join, because
+    a LEFT JOIN onto chapter would multiply the memoir row by its chapters and
+    need a GROUP BY over every column above to put it back together.
     """
     async with db() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -270,7 +274,9 @@ async def list_memoirs_for_owner(user_id: str) -> list[dict]:
             SELECT m.id, m.subject_name, m.born_year, m.through_year,
                    m.subject_is_living, m.never_forget,
                    m.status::text AS status, m.created_at,
-                   l.token AS link_token
+                   l.token AS link_token,
+                   (SELECT count(*) FROM chapter c
+                     WHERE c.memoir_id = m.id) AS chapter_count
               FROM memoir m
               LEFT JOIN memoir_link l
                      ON l.memoir_id = m.id

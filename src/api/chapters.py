@@ -16,6 +16,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from src.api.dependencies import CurrentUser, current_user
 from src.api.media import optional_user_id
+from src.domain.chapters.assembly_service import (
+    MemoirSealed,
+    NothingToAssemble,
+    assemble,
+)
 from src.domain.chapters.chapter_service import (
     NameRequired,
     SpanOutOfRange,
@@ -26,6 +31,7 @@ from src.domain.chapters.chapter_service import (
     reading_for_owner,
 )
 from src.models.chapter_models import (
+    AssemblyResult,
     Chapter,
     CommentCreate,
     CommentReceipt,
@@ -101,6 +107,50 @@ async def get_owner_reading(memoir_id: UUID, user: CurrentUser = Depends(current
     if reading is None:
         raise HTTPException(status_code=404, detail="memoir not found")
     return reading
+
+
+# ---------------------------------------------------------------------------
+# Making the book in the first place
+# ---------------------------------------------------------------------------
+
+
+@router.post("/memoirs/{memoir_id}/assemble", response_model=AssemblyResult)
+async def post_assemble(
+    memoir_id: UUID, user: CurrentUser = Depends(current_user)
+):
+    """Turn everything in the archive into chapters. Owner only.
+
+    Bearer only, with no link path at all — this is the one route in the file
+    that writes the book rather than reading it, and a share token is not
+    permission to rewrite somebody's memoir.
+
+    200 rather than 201: running it again replaces what was there, so it is not
+    creating a resource at an address the caller did not already have.
+    """
+    try:
+        result = await assemble(str(memoir_id), user.id)
+    except NothingToAssemble:
+        # The memoir is real and it is theirs, it is simply empty. 400 with
+        # something the frontend can show, rather than the 404 below — telling
+        # someone their memoir does not exist because they have not added a
+        # memory yet would be a lie.
+        raise HTTPException(
+            status_code=400,
+            detail="there are no memories to assemble yet",
+        )
+    except MemoirSealed:
+        # 409: the request was well-formed and conflicts with state that
+        # already exists. A published memoir cannot be reassembled — every
+        # comment in it is anchored to characters in the text it would rewrite.
+        raise HTTPException(
+            status_code=409,
+            detail="a published memoir cannot be reassembled",
+        )
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+
+    return result
 
 
 # ---------------------------------------------------------------------------

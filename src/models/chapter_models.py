@@ -294,3 +294,22 @@ class CommentReceipt(BaseModel):
 
     thread: CommentThread
     participant_token: str | None
+
+
+class AssemblyResult(BaseModel):
+    """What assembling an archive into chapters actually produced.
+
+    Four counts and nothing else. The owner is about to be told a number and it
+    should be the real one — "8 chapters, 41 paragraphs" is a fact about their
+    archive, not a score, and it is deliberately not a percentage of anything.
+    A memoir has no denominator.
+
+    `figures` can legitimately be lower than the number of photographs in the
+    archive: a photograph in a chapter with no prose has no paragraph to sit
+    beside, and the schema will not store one without an anchor.
+    """
+
+    chapters: int
+    blocks: int
+    sources: int
+    figures: int

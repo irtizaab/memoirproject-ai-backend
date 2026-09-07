@@ -295,16 +295,25 @@ Not built yet:
   reach that state through a factory. Chapters and comments now exist
   (migration `0011`) — what is missing above them is the publish endpoint and
   the export.
-- **Chapter assembly.** Transcription is done; turning many contributions into
-  chapters is not. That step reads the whole archive — typed memories and photo
-  captions included, which AssemblyAI has never seen — so it is a direct Claude
-  call, not AssemblyAI's LeMUR. Deliberately no `entity_detection`,
-  `summarization` or `auto_chapters` on the transcript job: each is billed per
-  audio hour on top, and the assembly step extracts the same facts across more
-  material. The shape it must emit is now fixed by migration `0011` and
-  `src/models/chapter_models.py`: ordered blocks, figures with a placement and
-  an anchor, and `block_source` rows carrying character offsets into each
-  paragraph. Write the prompt against that, not against a fresh design.
+- **Chapter assembly by Claude.** `POST /memoirs/{id}/assemble` exists and
+  writes real chapters, but it groups memories by decade rather than reading
+  them: `src/domain/chapters/assembly_service.py`, and `_plan()` is the only
+  function the model call replaces. Everything around it — the writes, the
+  figure anchoring, the whole-block attribution, the rebuild-not-append rule —
+  is the real thing and stays.
+
+  The version that reads the archive is a direct Claude call, not AssemblyAI's
+  LeMUR, because it must see typed memories and photo captions AssemblyAI never
+  had. Deliberately no `entity_detection`, `summarization` or `auto_chapters` on
+  the transcript job: each is billed per audio hour on top, and assembly
+  extracts the same facts across more material. The shape it must emit is fixed
+  by migration `0011` and `src/models/chapter_models.py`: ordered blocks,
+  figures with a placement and an anchor, and `block_source` rows carrying
+  character offsets into each paragraph. Write the prompt against that, not
+  against a fresh design — and note that the deterministic version writes NULL
+  offsets because a paragraph is one person's words verbatim. The moment prose
+  is composed from several memories, every offset the model returns has to be
+  checked against the block text before it is stored.
 - **Transcript editing.** Transcripts are machine input, read-only. Correction
   happens once, at the assembly step, rather than by asking a grieving family to
   proofread every recording.

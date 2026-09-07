@@ -52,6 +52,20 @@ class MemoirSummary(BaseModel):
     # leaves the memoir briefly with no live link — a real state, not an error.
     link_token: str | None
 
+    # How many chapters the archive has been assembled into, and therefore the
+    # answer to "is there a book yet". The dashboard shows nothing that opens
+    # the reader until this is above zero, because a memoir with no chapters
+    # opens onto an empty page.
+    #
+    # A count rather than an `assembled_at` timestamp: chapters existing is the
+    # fact the frontend actually needs, it is true whether they were assembled
+    # or inserted by SQL, and migration 0011 warned specifically against adding
+    # columns for a step that had not been written yet.
+    #
+    # Defaulted, because a memoir being claimed has none and POST /memoirs/claim
+    # returns this same model a moment after the row is created.
+    chapter_count: int = 0
+
 
 class AccountOverview(BaseModel):
     """Body of GET /me — who the caller is, and what they own.
