@@ -321,7 +321,7 @@ Not built yet:
   still growing, and printing it freezes half a conversation. The photographs
   are left out for now because signed URLs and image scaling are their own
   slice; the sources still name them.
-- **Chapter assembly by Claude.** `POST /memoirs/{id}/assemble` exists and
+- **Chapter assembly by an LLM.** `POST /memoirs/{id}/assemble` exists and
   writes real chapters, but it groups memories by decade rather than reading
   them: `src/domain/chapters/assembly_service.py`, and `_plan()` is the only
   function the model call replaces. Everything around it — the writes, the
