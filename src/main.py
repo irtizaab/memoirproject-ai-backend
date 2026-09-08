@@ -50,6 +50,10 @@ app.add_middleware(
     allow_origins=settings.allowed_origins_list,
     allow_methods=["*"],
     allow_headers=["*"],
+    # A browser hides every response header from JavaScript except a handful of
+    # safelisted ones, so this has to be named or the PDF export arrives with no
+    # filename and every memoir a family downloads is called "memoir.pdf".
+    expose_headers=["Content-Disposition"],
 )
 
 # Turn Postgres constraint violations into 400/409 responses instead of 500s.
