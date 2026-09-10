@@ -98,6 +98,25 @@ class ContributedMemory(BaseModel):
     # `domain/memories/memory_service.py`.
     display_name: str = Field(..., min_length=1, max_length=120)
 
+    # How they knew the subject. Optional, and `None` means "leave whatever is
+    # already there", not "reset me to other".
+    #
+    # Two things read it. The reader prints it under people's names in a credit
+    # line, which until now said "other" for every contributor in every memoir.
+    # And the question library picks what somebody is asked from the group they
+    # are in — what you ask a widow is not what you ask a colleague — so
+    # without this the whole library collapses to one set.
+    #
+    # A Literal rather than a free string, so a bad value is a 422 naming the
+    # field instead of a 22P02 from the `relationship_group` cast. The reader's
+    # door takes free text into `relationship_label` instead: somebody
+    # describing themselves in a sentence is a different question from somebody
+    # picking which group they are in.
+    relationship: (
+        Literal["child", "grandchild", "spouse_partner", "friend", "self", "other"]
+        | None
+    ) = None
+
     # Returned to the browser after the first contribution and sent back on
     # every later one, so a returning contributor is recognised as the same
     # person instead of appearing in the archive twice.

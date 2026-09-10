@@ -119,6 +119,28 @@ class Settings(BaseSettings):
     # 'skipped', and nothing is spent.
     transcription_enabled: bool = True
 
+    # --- Gemini (questions and chapter assembly) ----------------------------
+    # The API key. A secret of the same size as the AssemblyAI one: it can
+    # spend money on this account and nothing else. Confined to
+    # src/integrations/gemini.py.
+    gemini_api_key: str | None = None
+
+    # The default model. `gemini-2.5-flash` is what the follow-up questions
+    # use: they are short, they happen often, and a contributor is waiting for
+    # one. Assembly passes `model=` explicitly and asks for something slower.
+    gemini_model: str = "gemini-2.5-flash"
+
+    # The model that reads a whole archive and plans the chapters. Runs once,
+    # by hand, on far more material, and the judgement it needs is the whole
+    # point of the call — so the more capable tier, and a setting rather than a
+    # constant so it can be changed without a deploy.
+    gemini_assembly_model: str = "gemini-2.5-pro"
+
+    # The kill switch, mirroring `transcription_enabled`. Set false and
+    # contributors simply get no follow-up question, and assembly falls back to
+    # grouping by decade. Nothing fails and nothing is spent.
+    ai_enabled: bool = True
+
     # Registers POST /dev/signin. Off unless explicitly switched on, so the
     # route cannot exist in production by accident. See src/api/dev.py.
     enable_dev_routes: bool = False

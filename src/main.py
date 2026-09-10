@@ -19,6 +19,7 @@ from src.api.links import router as links_router
 from src.api.media import router as media_router
 from src.api.memoirs import router as memoirs_router
 from src.api.memories import router as memories_router
+from src.api.prompts import router as prompts_router
 from src.api.webhooks import router as webhooks_router
 from src.core.app_lifespan import lifespan
 from src.core.config import settings
@@ -73,6 +74,7 @@ app.include_router(contributors_router)  # contributors list, link reissue (auth
 app.include_router(webhooks_router)    # POST  /webhooks/assemblyai  (secret hdr)
 app.include_router(billing_router)     # GET /plans (public), /billing + PATCH (auth)
 app.include_router(chapters_router)     # GET /r/{token} (public), chapters + comments
+app.include_router(prompts_router)      # questions: owner-side and contributor
 
 # Development-only routes, registered only when explicitly switched on.
 #

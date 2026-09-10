@@ -626,6 +626,7 @@ async def contribute_memory(link_token: str, payload: dict) -> dict | None:
             memoir_id=memoir_id,
             token=payload.get("participant_token"),
             display_name=payload["display_name"],
+            relationship=payload.get("relationship"),
         )
 
         memory = await _insert_memory(cur, memoir_id, str(participant["id"]), payload)
@@ -638,7 +639,11 @@ async def contribute_memory(link_token: str, payload: dict) -> dict | None:
 
 
 async def resolve_participant(
-    cur, memoir_id: str, token: str | None, display_name: str
+    cur,
+    memoir_id: str,
+    token: str | None,
+    display_name: str,
+    relationship: str | None = None,
 ) -> dict:
     """Find the returning contributor, or create a new one.
 
@@ -682,6 +687,21 @@ async def resolve_participant(
     into another still posts as the person it was merged into. Both tokens keep
     working and both lead to one entry — which is why the merge marks a row
     rather than deleting it. See `migrations/0010_contributor_merge.sql`.
+
+    ---------------------------------------------------------------------
+    The relationship, and why it used to be a lie
+    ---------------------------------------------------------------------
+    Every contributor used to be written as `'other'`, hardcoded, because
+    nothing asked. That was invisible until two things started reading it: the
+    reader's credit lines, which printed "other" under people's names, and the
+    question library, which picks what somebody is asked from the group they
+    are in. A memoir where everyone is 'other' gets one set of questions for
+    the widow and the colleague alike.
+
+    Optional here, and `None` means "leave it alone" rather than "reset it to
+    other". `reader_gate` calls this without one — somebody arriving to read
+    the finished book is not being asked to re-declare themselves — and a
+    contributor on a phone may have skipped the chips.
     """
     if token:
         await cur.execute(
@@ -715,6 +735,25 @@ async def resolve_participant(
                         "participant_id": str(existing["id"]),
                     },
                 )
+
+            if relationship:
+                # Written through on a return visit, like the name above and
+                # guarded the same way. Somebody who picked "Friend" the first
+                # time and "Cousin" the second meant the second one.
+                await cur.execute(
+                    """
+                    UPDATE memoir_participant
+                       SET relationship = %(relationship)s::relationship_group
+                     WHERE memoir_id = %(memoir_id)s
+                       AND id = %(participant_id)s
+                       AND relationship <> %(relationship)s::relationship_group
+                    """,
+                    {
+                        "relationship": relationship,
+                        "memoir_id": memoir_id,
+                        "participant_id": str(existing["id"]),
+                    },
+                )
             return existing
 
         logger.info("Contributor token did not match; treating as a new person")
@@ -725,11 +764,19 @@ async def resolve_participant(
             (memoir_id, role, display_name, relationship,
              first_opened_at, contributor_token)
         VALUES
-            (%(memoir_id)s, 'contributor', %(display_name)s, 'other',
+            (%(memoir_id)s, 'contributor', %(display_name)s,
+             COALESCE(%(relationship)s, 'other')::relationship_group,
              now(), encode(gen_random_bytes(24), 'hex'))
         RETURNING id, contributor_token
         """,
-        {"memoir_id": memoir_id, "display_name": display_name.strip()},
+        {
+            "memoir_id": memoir_id,
+            "display_name": display_name.strip(),
+            # 'other' is still the fallback, and still the right one: it is
+            # what somebody who did not say is. What changed is that it is no
+            # longer what everybody is.
+            "relationship": relationship,
+        },
     )
     return await cur.fetchone()
 

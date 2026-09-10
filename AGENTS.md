@@ -214,6 +214,111 @@ it returns fluent, confident nonsense, which is worse.
   SQL. What this slice settles is the shape that step has to emit, which is the
   part that gets expensive to change once a prompt is written against it.
 
+**AI: the question library and assembly** (migration `0014`)
+
+One integration, `src/integrations/gemini.py`, spent on two things. It is a
+direct REST call through the shared `httpx.AsyncClient`, **not** the
+`google-genai` SDK — that client is synchronous by default and would block the
+event loop, which is what `test_no_blocking_io_in_src` exists to catch. It takes
+a Pydantic class and returns an instance of it; there is no path that returns
+free text. `AI_ENABLED` is the kill switch, the same shape as
+`TRANSCRIPTION_ENABLED`, and `GEMINI_API_KEY` is a secret confined to that one
+module.
+
+Gemini rather than Claude. The line this file used to carry — "a direct Claude
+call, not AssemblyAI's LeMUR" — was about making a *direct model call* over
+material AssemblyAI never sees (typed memories, photo captions), and that
+reasoning is unchanged. The vendor is not. Still deliberately no
+`entity_detection`, `summarization` or `auto_chapters` on the transcript job:
+each is billed per audio hour on top, and assembly extracts the same facts
+across more material.
+
+- **The question library.** The owner writes a line about the subject on
+  `/questions`, a model drafts four or five plain questions for each
+  `relationship_group`, and they edit any of them by hand or ask for a fresh
+  set. `GET`/`POST /memoirs/{id}/questions{,/generate}`, `PATCH
+  /memoirs/{id}/questions/mode`, `PATCH`/`DELETE /questions/{id}`, and
+  `GET /j/{token}/questions` for the contributor.
+
+  **The owner is in the middle of it, and that is the design.** An earlier
+  version wrote a question per contributor out of the memory they had just
+  left, and the owner never saw any of it — a model deciding, unsupervised and
+  one person at a time, what a grieving family would be asked about somebody
+  they had lost. The model drafts, the owner reads and edits, and only then is
+  anybody asked anything.
+
+  **Two sets, and neither is "off".** `questions_mode` is `standard` or
+  `custom`. Standard is the constant in `domain/prompts/standard_questions.py`
+  — written, not generated, and covering every group — and it is the default,
+  so a memoir whose owner never opens the screen still shows contributors
+  something. It is also the fallback for every failure and for a group the
+  owner emptied, because the blank page is the problem this feature exists to
+  solve. Switching modes destroys neither set.
+
+  **`source` is what makes editing safe.** A question becomes `'owner'` the
+  moment it is edited by hand, and a rewrite replaces the `'ai'` rows and
+  leaves those alone. Losing a generated question costs a model call; losing a
+  hand-written one costs the sentence a person chose. `replace_edited` is the
+  owner saying "start again" and is never the default.
+
+  **`never_forget` is finally consumed.** Onboarding's last screen has always
+  promised "it becomes the first question your family is asked", and nothing
+  read it. `_describe()` sends it as the seed for the first question of every
+  group. It reaches the model and no contributor — it stays excluded from every
+  response model a link can reach, exactly as `LinkInvitation` and
+  `MemoirReading` exclude it.
+
+  **A contributor sees text and nothing else.** `ContributorQuestions` declares
+  the questions and the group name; no ids for rows they cannot edit, no
+  `source` saying which a model wrote, no mode, and above all not
+  `subject_notes`. Generation fails as **503**, not 500: nothing is broken, an
+  upstream service was away, and the notes are saved before the call so a
+  failure never costs the owner what they typed.
+
+  **This needed the contribute form to start asking who somebody is.**
+  `resolve_participant()` wrote `'other'` for every contributor, hardcoded, so
+  a per-group library would have collapsed to one set. `ContributedMemory` now
+  carries an optional `relationship`, written through on create and on return
+  visits the same way `display_name` is. `None` means "leave it alone", not
+  "reset to other". It also fixes the reader's credit lines, which read "other"
+  under everybody's name.
+
+- **Chapter assembly.** `POST /memoirs/{id}/assemble` now reads the archive.
+  `src/domain/chapters/planner.py` holds the prompt, the schema and the
+  verification; `assembly_service.py` still owns every write, and `_plan()` is
+  the dispatcher between the two. Runs on `GEMINI_ASSEMBLY_MODEL` — the slower
+  tier, once, by hand.
+
+  **The model never returns a character offset.** It returns `quote`, the exact
+  substring of its own paragraph that came from one memory, and
+  `planner.verify` computes the offsets here with `str.find`. An integer a model
+  invents cannot be checked; a substring can. Found once → real offsets. Absent
+  or appearing twice → whole-block attribution with NULL offsets, logged: the
+  credit is still right and only the precision is lost, and a wrong offset is
+  permanent because publication is immutable. An unknown `memory_id` is dropped.
+  A block left with no valid source is dropped entirely — an unattributed
+  paragraph in this product is a fabricated one. `participant_id` is always read
+  from the archive row, never from the model.
+
+  **The fallback is not a stub.** `_plan_by_date()` is the old decade-banding
+  assembler, and it runs whenever the planner cannot: switched off, no key,
+  unreachable, refused, or a plan that survived verification with nothing left.
+  A memoir that cannot be assembled at all is unreachable — no reader, no
+  export, no search — which is worse than a book divided by decade. It also
+  cannot fabricate: it never rephrases, so every word is a word somebody typed
+  or spoke.
+
+  **Planning sits between two transactions, not inside one.** It can take
+  minutes, and a Postgres connection held open across an HTTP call is how a
+  bounded pool dies. The second transaction re-checks ownership and `status`
+  before writing, so nothing reaches a memoir published in between. All the
+  writes remain one transaction.
+
+  Figures are still placed by `_write_chapter`, not by the model, and a figure
+  anchors only to a `paragraph` — never to a `pull`, whose one lifted sentence
+  would caption a photograph with a fragment. Captions are still the
+  contributor's own words, read from the archive.
+
 Throughout: a central `psycopg.Error` handler mapping SQLSTATE codes to clean
 4xx JSON responses instead of raw 500s, plus a `PoolTimeout` handler answering
 503 when every connection is busy — both in `src/core/error_handlers.py`.
@@ -234,10 +339,14 @@ src/
     supabase_auth.py                 verify_access_token(), password_signin()
     supabase_storage.py              signed upload/download URLs, object_size()
     assemblyai.py                    submit(), fetch(), paragraphs()
+    gemini.py                        generate(prompt, schema) -> schema. Typed
+                                     JSON only; knows nothing about memoirs
   models/
     draft_models.py                  DraftUpdate
     memoir_models.py                 ClaimRequest, MemoirSummary, AccountOverview,
                                      LinkInvitation
+    prompt_models.py                 QuestionLibrary, Question, StandardGroup,
+                                     ContributorQuestions, Library
     memory_models.py                 Memory, MemoryCreate, ContributedMemory,
                                      MediaAsset, Transcript, UploadRequest/Ticket,
                                      StorageUsage
@@ -255,6 +364,10 @@ src/
     links/link_service.py            resolve_link()
     memories/memory_service.py       memories, owner-side and contributor-side;
                                      _derive_kind() decides what a memory *is*
+    prompts/prompt_service.py        get_library(), generate(), set_mode(),
+                                     update_question(), for_contributor()
+    prompts/standard_questions.py    the shipped set. Content, not code —
+                                     and the fallback for every failure
     media/media_service.py           begin_upload(), complete_upload()
     contributors/contributor_service.py  list_contributors(), reissue_link()
     billing/billing_service.py       get_billing_overview(), list_plans(), set_plan()
@@ -262,6 +375,10 @@ src/
                                      reconcile(), refresh_pending()
     chapters/chapter_service.py      reading_for_link()/for_owner(),
                                      get_chapter(), list_threads(), add_comment()
+    chapters/assembly_service.py     assemble(); _plan() dispatches, and
+                                     _plan_by_date() is the fallback
+    chapters/planner.py              the model call: prompt, schema, and
+                                     verify() — quotes in, offsets out
   api/
     dependencies.py                  current_user -> CurrentUser (401s live here)
     health.py                        GET  /health
@@ -282,6 +399,8 @@ src/
                                      GET  /memoirs/{id}/chapters  (auth)
                                      POST /memoirs/{id}/assemble  (auth)
                                      chapters + comments (either credential)
+    prompts.py                       questions: owner-side (auth) and
+                                     /j/{token}/questions (link + participant)
     webhooks.py                      POST /webhooks/assemblyai    (secret header)
     dev.py                           POST /dev/signin             (gated)
 ```
@@ -289,7 +408,8 @@ src/
 Environment variables (`.env`): `DATABASE_URL`, `SUPABASE_URL`,
 `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `ENABLE_DEV_ROUTES`,
 `ASSEMBLYAI_API_KEY`, `ASSEMBLYAI_WEBHOOK_SECRET`, `PUBLIC_BASE_URL`,
-`TRANSCRIPTION_ENABLED`, `ALLOWED_ORIGINS`, `DB_POOL_MIN_SIZE`,
+`TRANSCRIPTION_ENABLED`, `GEMINI_API_KEY`, `GEMINI_MODEL`,
+`GEMINI_ASSEMBLY_MODEL`, `AI_ENABLED`, `ALLOWED_ORIGINS`, `DB_POOL_MIN_SIZE`,
 `DB_POOL_MAX_SIZE`, `DB_POOL_TIMEOUT`.
 
 `PUBLIC_BASE_URL` is deliberately **empty in local development** — localhost is
@@ -298,8 +418,9 @@ does the work. No tunnel is needed to develop or test this.
 
 The first three are **not** secrets — the URL and anon key ship in every
 frontend bundle, and token verification uses the public JWKS. The service role
-key **is** a secret, is the only one this app holds, and exists for exactly one
-reason: signing upload URLs for contributors, who have no token of their own.
+key **is** a secret, is the only one of its kind this app holds (the AssemblyAI
+and Gemini keys are smaller: each can spend money on its own account and nothing
+else), and exists for exactly one reason: signing upload URLs for contributors, who have no token of their own.
 It is confined to `src/integrations/supabase_storage.py`. Never log it, never
 return it, never send it to the browser.
 
@@ -321,25 +442,6 @@ Not built yet:
   still growing, and printing it freezes half a conversation. The photographs
   are left out for now because signed URLs and image scaling are their own
   slice; the sources still name them.
-- **Chapter assembly by an LLM.** `POST /memoirs/{id}/assemble` exists and
-  writes real chapters, but it groups memories by decade rather than reading
-  them: `src/domain/chapters/assembly_service.py`, and `_plan()` is the only
-  function the model call replaces. Everything around it — the writes, the
-  figure anchoring, the whole-block attribution, the rebuild-not-append rule —
-  is the real thing and stays.
-
-  The version that reads the archive is a direct Claude call, not AssemblyAI's
-  LeMUR, because it must see typed memories and photo captions AssemblyAI never
-  had. Deliberately no `entity_detection`, `summarization` or `auto_chapters` on
-  the transcript job: each is billed per audio hour on top, and assembly
-  extracts the same facts across more material. The shape it must emit is fixed
-  by migration `0011` and `src/models/chapter_models.py`: ordered blocks,
-  figures with a placement and an anchor, and `block_source` rows carrying
-  character offsets into each paragraph. Write the prompt against that, not
-  against a fresh design — and note that the deterministic version writes NULL
-  offsets because a paragraph is one person's words verbatim. The moment prose
-  is composed from several memories, every offset the model returns has to be
-  checked against the block text before it is stored.
 - **Transcript editing.** Transcripts are machine input, read-only. Correction
   happens once, at the assembly step, rather than by asking a grieving family to
   proofread every recording.
