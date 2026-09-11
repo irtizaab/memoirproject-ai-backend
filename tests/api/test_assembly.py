@@ -23,6 +23,26 @@ from tests.conftest import requires_db
 pytestmark = [requires_db, pytest.mark.db]
 
 
+def make_book(client, memoir_id):
+    """Plan, then assemble. What one button used to do, in the two calls it is.
+
+    Assembly reads a stored plan, so every test that wants a book has to make
+    one first. Wrapped rather than repeated because the interesting assertion
+    in most of these tests is about what came out, not about the two-step —
+    and the two tests that *are* about the two-step call the routes directly.
+
+    `GEMINI_API_KEY` is deliberately unset in `conftest`, so the plan these
+    tests get is `by_date`: the decade fallback, verbatim paragraphs, whole
+    attribution. That is the point. Every promise asserted below has to hold
+    for the assembler that cannot fabricate anything, and the planner path is
+    tested separately with the model stubbed.
+    """
+    planned = client.post(f"/memoirs/{memoir_id}/plan")
+    assert planned.status_code == 200, planned.text
+    assert planned.json()["organised_by"] == "by_date"
+    return client.post(f"/memoirs/{memoir_id}/assemble")
+
+
 @pytest.fixture
 def archive(factory, owner):
     """A memoir with four memories across two decades, one of them undated.
@@ -89,9 +109,7 @@ def archive(factory, owner):
 
 def test_an_archive_becomes_a_book(as_owner, archive):
     """The whole point: memories in, chapters out, counted honestly."""
-    response = as_owner(archive["owner_id"]).post(
-        f"/memoirs/{archive['memoir_id']}/assemble"
-    )
+    response = make_book(as_owner(archive["owner_id"]), archive["memoir_id"])
 
     assert response.status_code == 200
     result = response.json()
@@ -111,7 +129,7 @@ def test_chapters_come_back_in_the_order_they_were_lived(as_owner, archive):
     evidence that nobody was asked — so it does not get sorted among the years.
     """
     client = as_owner(archive["owner_id"])
-    client.post(f"/memoirs/{archive['memoir_id']}/assemble")
+    make_book(client, archive["memoir_id"])
 
     reading = client.get(f"/memoirs/{archive['memoir_id']}/chapters").json()
     titles = [chapter["title"] for chapter in reading["chapters"]]
@@ -128,7 +146,7 @@ def test_a_chapter_only_claims_years_somebody_supplied(as_owner, archive):
     1982–1991.
     """
     client = as_owner(archive["owner_id"])
-    client.post(f"/memoirs/{archive['memoir_id']}/assemble")
+    make_book(client, archive["memoir_id"])
 
     reading = client.get(f"/memoirs/{archive['memoir_id']}/chapters").json()
     first, second, undated = reading["chapters"]
@@ -146,7 +164,7 @@ def test_a_paragraph_is_the_contributors_own_words(as_owner, archive):
     credited whole: the text of a paragraph is one field of one memory, copied.
     """
     client = as_owner(archive["owner_id"])
-    client.post(f"/memoirs/{archive['memoir_id']}/assemble")
+    make_book(client, archive["memoir_id"])
 
     reading = client.get(f"/memoirs/{archive['memoir_id']}/chapters").json()
     chapter_id = reading["chapters"][0]["id"]
@@ -159,7 +177,7 @@ def test_a_paragraph_is_the_contributors_own_words(as_owner, archive):
 def test_every_paragraph_carries_the_person_who_said_it(as_owner, archive):
     """A block with no source is a sentence nobody said."""
     client = as_owner(archive["owner_id"])
-    client.post(f"/memoirs/{archive['memoir_id']}/assemble")
+    make_book(client, archive["memoir_id"])
 
     reading = client.get(f"/memoirs/{archive['memoir_id']}/chapters").json()
     chapter = client.get(f"/chapters/{reading['chapters'][0]['id']}").json()
@@ -198,7 +216,7 @@ def test_a_recording_speaks_through_its_transcript(as_owner, factory, owner):
     factory.transcript(asset["id"], text="She was not practising. She was talking to it.")
 
     client = as_owner(str(owner["account"]["id"]))
-    client.post(f"/memoirs/{memoir_id}/assemble")
+    make_book(client, memoir_id)
 
     reading = client.get(f"/memoirs/{memoir_id}/chapters").json()
     chapter = client.get(f"/chapters/{reading['chapters'][0]['id']}").json()
@@ -225,7 +243,7 @@ def test_an_unfinished_recording_says_nothing(as_owner, factory, owner):
     factory.transcript(asset["id"], status="queued", text=None)
 
     response = as_owner(str(owner["account"]["id"])).post(
-        f"/memoirs/{memoir_id}/assemble"
+        f"/memoirs/{memoir_id}/plan"
     )
 
     assert response.status_code == 400
@@ -256,7 +274,7 @@ def test_a_photograph_sits_beside_a_paragraph(as_owner, factory, owner):
     factory.asset(memoir_id, memory_id=photo["id"], kind="image")
 
     client = as_owner(str(owner["account"]["id"]))
-    result = client.post(f"/memoirs/{memoir_id}/assemble").json()
+    result = make_book(client, memoir_id).json()
 
     assert result["figures"] == 1
 
@@ -298,9 +316,7 @@ def test_a_photograph_with_nothing_to_sit_beside_is_left_out(
     )
     factory.asset(memoir_id, memory_id=photo["id"], kind="image")
 
-    result = as_owner(str(owner["account"]["id"])).post(
-        f"/memoirs/{memoir_id}/assemble"
-    ).json()
+    result = make_book(as_owner(str(owner["account"]["id"])), memoir_id).json()
 
     assert result["chapters"] == 1
     assert result["figures"] == 0
@@ -315,8 +331,8 @@ def test_assembling_twice_rebuilds_rather_than_doubles(as_owner, archive):
     """The owner adds a memory and runs it again. They get a book, not two."""
     client = as_owner(archive["owner_id"])
 
-    first = client.post(f"/memoirs/{archive['memoir_id']}/assemble").json()
-    second = client.post(f"/memoirs/{archive['memoir_id']}/assemble").json()
+    first = make_book(client, archive["memoir_id"]).json()
+    second = make_book(client, archive["memoir_id"]).json()
 
     assert first == second
 
@@ -328,14 +344,22 @@ def test_a_published_memoir_is_never_reassembled(as_owner, factory, archive):
     Rewriting the blocks under a published memoir would leave every one of them
     pointing at words that had moved — silently, and forever.
     """
+    client = as_owner(archive["owner_id"])
+    # Planned while it was still a draft, so what is refused below is the
+    # write and not the model call.
+    assert client.post(f"/memoirs/{archive['memoir_id']}/plan").status_code == 200
+
     factory.publish(archive["memoir_id"])
 
-    response = as_owner(archive["owner_id"]).post(
-        f"/memoirs/{archive['memoir_id']}/assemble"
-    )
+    response = client.post(f"/memoirs/{archive['memoir_id']}/assemble")
 
     assert response.status_code == 409
     assert "published" in response.json()["detail"]
+
+    # And replanning is refused too, for the same reason: a fresh plan on a
+    # sealed memoir is a document that can never be written.
+    replanned = client.post(f"/memoirs/{archive['memoir_id']}/plan")
+    assert replanned.status_code == 409
 
 
 def test_an_empty_archive_is_not_a_missing_memoir(as_owner, owner):
@@ -345,7 +369,7 @@ def test_an_empty_archive_is_not_a_missing_memoir(as_owner, owner):
     memory yet would be a lie about the thing they care most about.
     """
     response = as_owner(str(owner["account"]["id"])).post(
-        f"/memoirs/{owner['memoir']['id']}/assemble"
+        f"/memoirs/{owner['memoir']['id']}/plan"
     )
 
     assert response.status_code == 400
@@ -364,6 +388,12 @@ def test_a_stranger_cannot_assemble_someone_elses_memoir(as_owner, stranger, arc
     )
 
     assert response.status_code == 404
+
+    # And the same for the step before it, which is the one that spends money.
+    planned = as_owner(str(stranger["account"]["id"])).post(
+        f"/memoirs/{archive['memoir_id']}/plan"
+    )
+    assert planned.status_code == 404
 
 
 def test_a_memoir_that_does_not_exist_answers_the_same_way(as_owner, archive):
@@ -386,7 +416,7 @@ def test_assembly_touches_nothing_outside_its_own_memoir(
     theirs = str(stranger["memoir"]["id"])
     factory.chapter(theirs, ordinal=0, title="Their chapter")
 
-    as_owner(archive["owner_id"]).post(f"/memoirs/{archive['memoir_id']}/assemble")
+    make_book(as_owner(archive["owner_id"]), archive["memoir_id"])
 
     reading = as_owner(str(stranger["account"]["id"])).get(
         f"/memoirs/{theirs}/chapters"
@@ -411,7 +441,7 @@ def test_the_account_says_whether_there_is_a_book_yet(as_owner, archive):
     before = client.get("/me").json()
     assert before["memoirs"][0]["chapter_count"] == 0
 
-    client.post(f"/memoirs/{archive['memoir_id']}/assemble")
+    make_book(client, archive["memoir_id"])
 
     after = client.get("/me").json()
     assert after["memoirs"][0]["chapter_count"] == 3

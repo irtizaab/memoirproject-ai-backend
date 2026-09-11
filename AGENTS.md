@@ -31,7 +31,11 @@ a product bug, not a style preference:
   only. Any feature that assumes a contributor has a `user_id` is wrong.
 - **Publication is immutable.** Once a memoir's status flips to `published`,
   its content can never be edited — not by the owner, not by an admin. New
-  material after publication means a new memoir, not an edit.
+  material after publication means a new memoir, not an edit. Before sealing
+  the opposite holds: the owner may change anything by hand, and
+  `PATCH /chapters/{id}` is how. Immutability is a property of **sealing**, not
+  of assembly — conflating the two left owners unable to fix one sentence in
+  their own draft.
 - **Never fabricate.** The system organizes and connects what humans
   supplied. It does not invent memories, generate synthetic media, or merge
   two people's conflicting accounts into one "true" version. Divergent
@@ -210,9 +214,10 @@ it returns fluent, confident nonsense, which is worse.
   and a returning reader is recognised by the same `contributor_token` they
   already hold — `resolve_participant()`, shared with the memories path rather
   than copied.
-- Nothing here **writes** a chapter. Assembly is still to come; rows arrive by
-  SQL. What this slice settles is the shape that step has to emit, which is the
-  part that gets expensive to change once a prompt is written against it.
+- Nothing here **writes** a chapter: `assembly_service` builds them from the
+  archive and `page_service` applies the owner's hand corrections. What this
+  slice settled is the shape both of them have to emit, which is the part that
+  gets expensive to change once a prompt is written against it.
 
 **AI: the question library and assembly** (migration `0014`)
 
@@ -283,11 +288,90 @@ across more material.
   "reset to other". It also fixes the reader's credit lines, which read "other"
   under everybody's name.
 
-- **Chapter assembly.** `POST /memoirs/{id}/assemble` now reads the archive.
-  `src/domain/chapters/planner.py` holds the prompt, the schema and the
-  verification; `assembly_service.py` still owns every write, and `_plan()` is
-  the dispatcher between the two. Runs on `GEMINI_ASSEMBLY_MODEL` — the slower
-  tier, once, by hand.
+- **Chapter assembly, in three steps** (migrations `0015`, `0016`).
+  `POST /memoirs/{id}/plan` reads the archive and decides what the book is;
+  `GET`/`PATCH` on the same path read and correct that decision;
+  `POST /memoirs/{id}/assemble` writes it into chapters. `planner.py` holds the
+  prompt, the schema and the verification, `plan_service.py` owns the
+  `memoir_plan` row, and `assembly_service.py` still owns every write.
+
+  **Why the plan is a row now.** It used to be a local variable: the model
+  decided how a family's memoir divided into chapters and what each was called,
+  that went straight into the book, and the owner saw four counts. They could
+  not read the outline, rename a chapter, or tell whether the model had run.
+  Same argument migration `0014` makes about the question library, one step
+  later — written once, read before it is used, changed by hand when wrong.
+
+  It also moved the five-minute model call out of the assemble request.
+  `assemble()` is now Postgres end to end, and back to a single transaction.
+
+  **`organised_by` is on every response.** `planner` or `by_date`. Without it a
+  decade-banded book and a planned one are indistinguishable once written,
+  which is exactly how a deployment with no `GEMINI_API_KEY` produced the
+  fallback for every memoir and said nothing about it.
+
+  **The plan stays a draft until the memoir is sealed** — not until it is
+  assembled, which is what this used to say. Assembly is not what makes a
+  character offset permanent; publication is, and an unsealed book is rewritten
+  wholesale by the next `assemble()`. So the owner can keep correcting the
+  outline and press assemble again to apply it. `PATCH` may rename a chapter,
+  reorder or drop one, reorder, reword or drop a passage, and move or drop a
+  photograph. It may **not** reassign attribution: `block_source`'s memories are
+  read from the stored plan and never from the request. Chapter order is array
+  position, renumbered server-side; a chapter id the plan does not hold is a
+  400.
+
+- **The page itself is editable too** (`chapters/page_service.py`).
+  `PATCH /chapters/{id}` — owner bearer only, no link path, 409 once published.
+  The owner reads the assembled memoir at the frontend's `/preview/{memoir_id}`
+  and corrects what they find: the chapter title, the words of a passage, the
+  order of the page, which paragraph a photograph sits beside and how it is
+  shown, or whether any of it is there at all.
+
+  **Two surfaces, on purpose.** The outline is where the *shape* is decided —
+  which chapter a memory belongs in is a plan decision, and applying an outline
+  means reassembling. The page is where the *words* are fixed, without spending
+  a model call to change one of them. Reassembling replaces a hand-corrected
+  page, and the frontend says so before the button is pressed; nothing in the
+  API forbids it.
+
+  **What it refuses is what protects the product's first rule.** No passage can
+  be added — prose with no `block_source` behind it is a fabricated paragraph,
+  and this path has no archive to attribute one to — and no passage moves to
+  another chapter. A blank passage is a 400, not a silent delete; an emptied
+  chapter is a 409, because a chapter with no prose cannot hold its photographs
+  either.
+
+  **Every edited passage is re-surveyed**, by the same `plan_service.resurvey`
+  the plan uses — written once and imported, so attribution cannot come to mean
+  two different things depending on which screen the owner used.
+  `comment_thread` carries the same offsets and gets the same treatment:
+  normally there are none yet, but an owner can comment on their own draft, and
+  a comment pointing at moved words is the exact failure the offsets were
+  checked to avoid.
+
+  Ordinals are renumbered in two passes, parked high and then landed, because
+  `UNIQUE (chapter_id, ordinal)` fires halfway through a reorder otherwise.
+
+  **`plan_service.resurvey` is what makes editing safe.** A source's span is
+  character offsets into passage text. Edit the passage and every offset past
+  the edit is wrong — pointing at a clause somebody else said, permanently,
+  because publication is immutable. So each span is re-*found*: take the exact
+  substring the offsets covered, look for it in the new text, keep the span only
+  if it is there exactly once, and otherwise fall back to whole-block
+  attribution with NULL offsets. Same rule `verify` applies to an ambiguous
+  quote, for the same reason.
+
+  **A schema with an optional field used to fail silently, and did.**
+  Gemini's `responseSchema` is an OpenAPI **3.0** subset: nullability is
+  `nullable: true`, and `{"type": "null"}` — which is how Pydantic spells
+  `str | None` — makes it answer **400** to the whole request. `planner.plan()`
+  turns any failure into `None` and falls back, so `Plan`'s three optional
+  fields meant the planner had never once run in production while `Library`,
+  which has none, worked fine. `gemini._schema_for` now collapses the optional
+  shape; a genuine two-type union is deliberately left to fail loudly rather
+  than silently become one arbitrary half. `tests/unit/test_gemini.py` guards
+  it.
 
   **The model never returns a character offset.** It returns `quote`, the exact
   substring of its own paragraph that came from one memory, and
@@ -314,10 +398,51 @@ across more material.
   before writing, so nothing reaches a memoir published in between. All the
   writes remain one transaction.
 
-  Figures are still placed by `_write_chapter`, not by the model, and a figure
-  anchors only to a `paragraph` — never to a `pull`, whose one lifted sentence
-  would caption a photograph with a fragment. Captions are still the
-  contributor's own words, read from the archive.
+  **The model sees the photographs.** Every image in the archive is fetched
+  from the private bucket, re-encoded to 768px JPEG, and sent as an inline part
+  alongside the prompt, labelled with its `asset_id` so it can be named. It
+  returns, per photograph, the memory whose paragraph it belongs beside and a
+  placement: `margin`, `inset`, or `carousel` (migration `0016`) for several
+  pictures of one moment shown in turn. `verify_figures` checks every asset id
+  against what was actually read and every anchor against what the chapter
+  quotes; `_write_chapter` resolves the anchor to a block it wrote itself, never
+  to anything the model said about position. The old positional rule — first
+  inset, rest margin — remains as the fallback for a `by_date` plan.
+
+  **Three things had to change before it worked once, live.** All three failed
+  silently into the decade fallback, which is why `organised_by` exists.
+
+    `maxOutputTokens`   Unset means the model's default ceiling, and a plan is
+                        longer than the archive it came from — every composed
+                        paragraph plus a verbatim quote per source, with the
+                        3.x thinking tokens drawn from the same allowance. Past
+                        it the answer is not an error: it is JSON that stops
+                        mid-string. `planner.MAX_PLAN_TOKENS` asks for the
+                        tier's full 65,536, and `generate` now names a
+                        `MAX_TOKENS` finish reason instead of reporting a
+                        truncated document as a malformed one.
+    the retry schedule  `_BACKOFF_SECONDS` is two steps and four seconds,
+                        which is right for a contributor waiting on one
+                        question and wrong for this: a transient "high demand"
+                        503 gave up with five minutes of the call's own timeout
+                        unspent. Assembly passes `gemini.PATIENT_BACKOFF`
+                        instead — 150 seconds of waiting inside a 300-second
+                        budget. Two 503s and a success is now an ordinary run.
+    what the logs say   A `ValidationError` logged its own *count* ("1
+                        problems"). A block dropped for having no text was
+                        dropped in silence. Both now report shape and never
+                        content: Pydantic's `loc` and `type`, and one line
+                        counting chapters in/kept and blocks in/blank/
+                        unattributed.
+
+  Inline bytes are capped at 15 MB, roughly 150 photographs. Past it the rest
+  are not looked at (logged, and still placed by the fallback rule); the upgrade
+  path is Gemini's Files API, not a bigger number.
+
+  A figure still anchors only to a `paragraph` — never to a `pull`, whose one
+  lifted sentence would caption a photograph with a fragment. Captions are still
+  the contributor's own words, read from the archive, and `_SYSTEM` forbids the
+  model describing a photograph even though it can now see one.
 
 Throughout: a central `psycopg.Error` handler mapping SQLSTATE codes to clean
 4xx JSON responses instead of raw 500s, plus a `PoolTimeout` handler answering
@@ -339,8 +464,9 @@ src/
     supabase_auth.py                 verify_access_token(), password_signin()
     supabase_storage.py              signed upload/download URLs, object_size()
     assemblyai.py                    submit(), fetch(), paragraphs()
-    gemini.py                        generate(prompt, schema) -> schema. Typed
-                                     JSON only; knows nothing about memoirs
+    gemini.py                        generate(prompt, schema, images=) ->
+                                     schema. Typed JSON only; knows nothing
+                                     about memoirs
   models/
     draft_models.py                  DraftUpdate
     memoir_models.py                 ClaimRequest, MemoirSummary, AccountOverview,
@@ -353,7 +479,8 @@ src/
     account_models.py                Contributor, ShareLink, Plan, BillingOverview
     chapter_models.py                Chapter, Block, BlockSource, Figure,
                                      CommentThread, CommentCreate/Receipt,
-                                     MemoirReading
+                                     MemoirReading, MemoirPlan, PlanUpdate,
+                                     ChapterEdit, BlockEdit, AssemblyResult
   domain/
     drafts/draft_service.py          create_draft(), update_draft()
     memoirs/memoir_service.py        claim_draft(), list_memoirs_for_owner();
@@ -375,10 +502,17 @@ src/
                                      reconcile(), refresh_pending()
     chapters/chapter_service.py      reading_for_link()/for_owner(),
                                      get_chapter(), list_threads(), add_comment()
-    chapters/assembly_service.py     assemble(); _plan() dispatches, and
-                                     _plan_by_date() is the fallback
-    chapters/planner.py              the model call: prompt, schema, and
-                                     verify() — quotes in, offsets out
+    chapters/assembly_service.py     generate_plan() and assemble(); _plan()
+                                     dispatches, _plan_by_date() is the
+                                     fallback, _photographs() reads the images
+    chapters/page_service.py         edit_chapter(): the assembled page as the
+                                     owner corrects it by hand, spans re-found
+    chapters/plan_service.py         the memoir_plan row: store/load/edit,
+                                     rehydrate(), and resurvey() — the rule
+                                     that keeps attribution true across an edit
+    chapters/planner.py              the model call: prompt, schema, images,
+                                     and verify()/verify_figures() — quotes and
+                                     asset ids in, offsets and anchors out
   api/
     dependencies.py                  current_user -> CurrentUser (401s live here)
     health.py                        GET  /health
@@ -397,7 +531,9 @@ src/
                                      POST /r/{token}/open         (the door)
                                      GET  /r/{token}    (link + reader session)
                                      GET  /memoirs/{id}/chapters  (auth)
+                                     POST/GET/PATCH /memoirs/{id}/plan (auth)
                                      POST /memoirs/{id}/assemble  (auth)
+                                     PATCH /chapters/{id}          (auth)
                                      chapters + comments (either credential)
     prompts.py                       questions: owner-side (auth) and
                                      /j/{token}/questions (link + participant)
@@ -411,6 +547,15 @@ Environment variables (`.env`): `DATABASE_URL`, `SUPABASE_URL`,
 `TRANSCRIPTION_ENABLED`, `GEMINI_API_KEY`, `GEMINI_MODEL`,
 `GEMINI_ASSEMBLY_MODEL`, `AI_ENABLED`, `ALLOWED_ORIGINS`, `DB_POOL_MIN_SIZE`,
 `DB_POOL_MAX_SIZE`, `DB_POOL_TIMEOUT`.
+
+`scripts/seed_demo_memoir.py` fills a memoir with material worth assembling —
+five contributors, fifteen dated memories, two accounts of one winter that
+differ — then plans and assembles it. It points at whatever database `.env`
+names, so it never deletes, matches contributors by name and memories by their
+first line to stay idempotent, and refuses a published memoir. `--adopt-photos`
+moves a stray photograph onto a memory that has words, because the planner can
+only place one beside a paragraph and an archive of orphaned images assembles
+with zero figures while behaving correctly.
 
 `PUBLIC_BASE_URL` is deliberately **empty in local development** — localhost is
 not reachable from the internet, so no webhook is requested and the poll path
@@ -435,13 +580,13 @@ Not built yet:
   `0004`/`0005` deliberately have no `subscription` table — the entitlement
   (what you get) is separate from the subscription (what you pay), so adding
   payments adds a table beside `plan` and changes nothing here.
-- **Photographs in the PDF.** `GET /memoirs/{id}/export.pdf` builds the book
-  with ReportLab (`src/domain/chapters/export_service.py`): title page, contents
-  on page one, the prose, and every source as a numbered note under its chapter.
-  The comment layer is deliberately left out — it is the one part of a memoir
-  still growing, and printing it freezes half a conversation. The photographs
-  are left out for now because signed URLs and image scaling are their own
-  slice; the sources still name them.
+- ~~**Photographs in the PDF.**~~ Done. `export_service` fetches each figure
+  with this service's own credentials, scales it to the text measure by aspect
+  ratio, and prints it after the paragraph it anchors to; a carousel group
+  becomes a run of plates, because paper does not advance. A photograph that
+  cannot be fetched or decoded is left out with a log line and the book is still
+  produced. The comment layer is still deliberately absent — it is the one part
+  of a memoir still growing, and printing it freezes half a conversation.
 - **Transcript editing.** Transcripts are machine input, read-only. Correction
   happens once, at the assembly step, rather than by asking a grieving family to
   proofread every recording.
@@ -730,11 +875,22 @@ and `README.md` use.
   | `db/` | 19 tests. That the CHECK constraints and partial indexes actually refuse what they claim to. |
   | `static/` | The conventions in this file, enforced by reading the source: no SQL in `api/`, no `fastapi` in `domain/`, no memoir vocabulary in `integrations/`, no route defined in `main.py`, no blanket `except Exception`, **every handler `async def`**, **no synchronous driver call anywhere under `src/`**, the service role key confined to one module, and **the API never answering 403**. |
 
+  **`AI_ENABLED=false` for the whole suite**, set in `conftest`'s environment
+  block. `Settings` reads `.env`, so without it a developer's real
+  `GEMINI_API_KEY` reaches the tests and every assembly test makes a live,
+  billed call — which is also how the fallback assertions used to pass for the
+  wrong reason: they were relying on that call *failing*. Tests that want the
+  planner path stub it on the consumer's own reference
+  (`assembly_service.planner.plan`), so one that forgets to stub fails loudly
+  instead of reaching Google.
+
   Fixtures build rows with SQL rather than by calling the API, so a test about deletion fails only
   when deletion is broken — and so it can construct states the application cannot reach, such as a
-  published memoir, or a chapter, which nothing here writes yet. `verify_slice3.py` in the repo
-  root is the ancestor of all this: it needed a live server, live Supabase and the real production
-  database to assert the same things, and it is kept only as a reference.
+  published memoir, or a chapter, which nothing here writes yet. The suite's ancestor was
+  `verify_slice3.py` in the repo root, deleted once this replaced it: it needed a live server, live
+  Supabase and the **real production database** to assert the same things, and the account it
+  hardcoded is still visible in that database as `slice3-verify@example.com`. A script that can only
+  be run against production is not a safety net.
 - **Storage cost is unbounded per account.** `plan.storage_limit_bytes` is stored and displayed,
   and `GET /billing` reports real usage against it, but nothing refuses an upload that would
   exceed it. The check belongs in `begin_upload()`.

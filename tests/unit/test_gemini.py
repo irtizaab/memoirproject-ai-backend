@@ -63,6 +63,41 @@ def test_unsupported_keys_are_stripped():
         assert "default" not in node
 
 
+def test_a_field_called_title_survives():
+    """Stripping the `title` keyword may not strip a field named `title`.
+
+    The regression this exists for: `properties` is a mapping of field names,
+    and the strip ran over it like any other dict, so `PlannedChapter.title`
+    was deleted from `properties` while `required` still demanded it. Gemini
+    answers `required[0]: property is not defined` — a 400, which
+    `planner.plan()` turns into None, which is the decade fallback again. The
+    nullable fix was necessary and this was the other half.
+    """
+
+    class Titled(BaseModel):
+        title: str = Field(description="what the chapter is called")
+        default: int = 0
+
+    schema = _schema_for(Titled)
+
+    assert schema["properties"]["title"]["type"] == "string"
+    assert schema["properties"]["title"]["description"] == "what the chapter is called"
+    assert "default" in schema["properties"]
+
+    # Every name `required` promises is actually defined — the exact thing
+    # Google checks before it looks at anything else.
+    assert set(schema.get("required", [])) <= set(schema["properties"])
+
+
+def test_every_required_field_of_a_plan_is_defined():
+    """The same check against the real model, where it actually broke."""
+    from src.domain.chapters.planner import Plan
+
+    for node in _walk(_schema_for(Plan)):
+        if "required" in node:
+            assert set(node["required"]) <= set(node.get("properties", {}))
+
+
 def test_structure_survives_the_flattening():
     """Stripping is not allowed to cost the parts that constrain the output."""
     schema = _schema_for(Trunk)
@@ -83,6 +118,127 @@ def test_descriptions_survive():
     """The description is the instruction. Losing it loses the rule."""
     schema = _schema_for(Branch)
     assert schema["properties"]["kind"]["description"] == "what this is"
+
+
+def test_an_optional_field_becomes_nullable_not_a_null_type():
+    """`str | None` has to reach Gemini as `nullable`, never as `type: null`.
+
+    The regression this exists for: Gemini's schema is OpenAPI 3.0, which has
+    no null type, and it answers 400 to the whole request rather than ignoring
+    the branch it dislikes. `planner.plan()` turns any 400 into None and falls
+    back to the decade assembler — so one optional field in a response model
+    was indistinguishable, from the outside, from the AI being switched off.
+    Which is what it had been doing to every memoir.
+    """
+    schema = _schema_for(Leaf)
+    quote = schema["properties"]["quote"]
+
+    assert quote["type"] == "string"
+    assert quote["nullable"] is True
+    assert "anyOf" not in quote
+
+    # And nowhere in the whole document, at any depth.
+    for node in _walk(_schema_for(Trunk)):
+        assert node.get("type") != "null"
+        assert "anyOf" not in node
+
+
+def test_a_nullable_field_keeps_its_description():
+    """The description is the instruction, and collapsing must not eat it.
+
+    `PlannedSource.quote` carries the rule that makes attribution checkable —
+    "copied character for character out of the text you just wrote". It is
+    written on the optional field, which is precisely the one being rewritten.
+    """
+
+    class Described(BaseModel):
+        quote: str | None = Field(default=None, description="quote your own paragraph")
+
+    quote = _schema_for(Described)["properties"]["quote"]
+
+    assert quote["description"] == "quote your own paragraph"
+    assert quote["nullable"] is True
+
+
+def test_a_union_of_two_real_types_is_left_alone():
+    """Only the optional shape is collapsed, not any union.
+
+    Choosing a winner between two real branches would need a judgement nothing
+    here is entitled to make. Nothing in this codebase sends such a union; if
+    something starts to, it should fail loudly at Gemini rather than quietly
+    become one arbitrary half of what was asked for.
+    """
+
+    class Either(BaseModel):
+        value: int | str
+
+    value = _schema_for(Either)["properties"]["value"]
+
+    assert "anyOf" in value
+    assert "nullable" not in value
+
+
+def test_a_503_is_retried_on_the_schedule_it_was_given(monkeypatch):
+    """Assembly waits, because assembly can afford to.
+
+    The regression: `gemini-3.5-flash` answered "this model is currently
+    experiencing high demand" three times inside seventeen seconds, the default
+    two-step schedule ran out, and a family's memoir was organised by decade
+    with five minutes of its own timeout unspent. The retry budget has to be
+    the caller's decision — a person waiting on a follow-up question and an
+    owner waiting on a whole book are not the same wait.
+    """
+    from src.core.config import settings
+    from src.integrations import gemini
+
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key")
+    monkeypatch.setattr(settings, "ai_enabled", True)
+
+    slept: list[float] = []
+    attempts = 0
+
+    class Answer:
+        """A 503 for every attempt but the last."""
+
+        def __init__(self, status: int, body: str = "{}"):
+            self.status_code = status
+            self.text = body
+
+        def json(self):
+            return {
+                "candidates": [
+                    {"content": {"parts": [{"text": '{"quote": null}'}]}}
+                ]
+            }
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return Answer(503) if attempts < 4 else Answer(200)
+
+    async def fake_client():
+        return Client()
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(gemini, "client", fake_client)
+    monkeypatch.setattr(gemini.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(gemini.generate("anything", Leaf, backoff=(5.0, 15.0, 40.0)))
+
+    assert attempts == 4
+    assert slept == [5.0, 15.0, 40.0]
+
+
+def test_the_default_schedule_is_the_short_one(monkeypatch):
+    """A contributor waiting on one question is not made to wait a minute."""
+    from src.integrations import gemini
+
+    assert gemini._BACKOFF_SECONDS == (1.0, 3.0)
+    # And the patient one is a real budget rather than a token gesture.
+    assert sum(gemini.PATIENT_BACKOFF) > 120
 
 
 def test_generate_refuses_without_a_key(monkeypatch):

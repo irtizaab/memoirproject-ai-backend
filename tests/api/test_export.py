@@ -15,7 +15,6 @@ import zlib
 import pytest
 
 from tests.conftest import requires_db
-from tests.factories import TEST_PASSPHRASE
 
 pytestmark = [requires_db, pytest.mark.db]
 

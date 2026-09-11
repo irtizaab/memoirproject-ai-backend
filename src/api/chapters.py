@@ -26,7 +26,16 @@ from src.domain.chapters.assembly_service import (
     MemoirSealed,
     NothingToAssemble,
     assemble,
+    generate_plan,
 )
+from src.domain.chapters.plan_service import (
+    NoPlanYet,
+    NothingLeft,
+    PlanSealed,
+    UnknownChapter,
+)
+from src.domain.chapters.plan_service import edit as edit_plan
+from src.domain.chapters.plan_service import read as read_plan
 from src.domain.chapters.chapter_service import (
     SpanOutOfRange,
     add_comment,
@@ -36,6 +45,13 @@ from src.domain.chapters.chapter_service import (
     reading_for_owner,
 )
 from src.domain.chapters.export_service import NothingToExport, export_pdf
+from src.domain.chapters.page_service import (
+    BadAnchor,
+    EmptyPassage,
+    PageEmptied,
+    UnknownBlock,
+    edit_chapter,
+)
 from src.domain.chapters.reader_gate import (
     ReaderNameRequired,
     open_for_reading,
@@ -45,6 +61,9 @@ from src.domain.chapters.search_service import search_memoir
 from src.models.chapter_models import (
     AssemblyResult,
     Chapter,
+    ChapterEdit,
+    MemoirPlan,
+    PlanUpdate,
     CommentCreate,
     CommentReceipt,
     CommentThread,
@@ -185,6 +204,134 @@ async def get_owner_reading(memoir_id: UUID, user: CurrentUser = Depends(current
 
 
 # ---------------------------------------------------------------------------
+# Deciding what the book is
+# ---------------------------------------------------------------------------
+#
+# Two steps, deliberately. `POST /plan` spends the model call and stores what
+# came back; `POST /assemble` writes it into chapters. Between them the owner
+# reads the plan and can change it, which is the whole reason the plan is a
+# resource rather than a local variable.
+#
+# Both are bearer-only with no link path. A share token is not permission to
+# decide what somebody's memoir says.
+
+
+@router.post("/memoirs/{memoir_id}/plan", response_model=MemoirPlan)
+async def post_plan(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+    """Read the archive and decide what the book is. Owner only.
+
+    The slow one. It reads every memory in the memoir, sends them to the
+    model, verifies every quote that comes back, and stores the result — up to
+    five minutes for a large archive, and the frontend allows for it.
+
+    200 rather than 201: there is one plan per memoir, at an address the caller
+    already had, and running this again replaces it rather than creating
+    something new.
+    """
+    try:
+        plan = await generate_plan(str(memoir_id), user.id)
+    except NothingToAssemble:
+        # The memoir is real and it is theirs, it is simply empty. 400 with
+        # something the frontend can show, rather than the 404 below — telling
+        # someone their memoir does not exist because they have not added a
+        # memory yet would be a lie.
+        raise HTTPException(
+            status_code=400,
+            detail="there are no memories to plan yet",
+        )
+    except MemoirSealed:
+        raise HTTPException(
+            status_code=409,
+            detail="a published memoir cannot be replanned",
+        )
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+
+    return plan
+
+
+@router.get("/memoirs/{memoir_id}/plan", response_model=MemoirPlan)
+async def get_plan(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+    """The plan as it stands. Owner only.
+
+    404 for a memoir that is not theirs and 404 for a memoir nobody has
+    planned are deliberately different: the second says so in the detail, so
+    the frontend can offer the button that fixes it instead of an error.
+    """
+    try:
+        plan = await read_plan(str(memoir_id), user.id)
+    except NoPlanYet:
+        raise HTTPException(
+            status_code=404,
+            detail="this memoir has not been planned yet",
+        )
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+
+    return plan
+
+
+@router.patch("/memoirs/{memoir_id}/plan", response_model=MemoirPlan)
+async def patch_plan(
+    memoir_id: UUID,
+    update: PlanUpdate,
+    user: CurrentUser = Depends(current_user),
+):
+    """Correct the plan before the book is written. Owner only.
+
+    Rename a chapter, move one, drop one, reorder or reword a passage, move a
+    photograph or leave it out. The whole chapter list arrives, in reading
+    order, and the server renumbers from array position rather than trusting an
+    ordinal a client chose.
+
+    **An assembled plan is still editable.** It used to be frozen the moment
+    the book was written from it, on the grounds that the offsets underneath
+    were now load-bearing. They are — but what makes them permanent is
+    publication, not assembly, and an unsealed book is rewritten wholesale by
+    the next `POST /assemble`. So the outline stays a draft until the memoir is
+    sealed, and assembling again is how a changed outline reaches the page.
+    That does overwrite anything corrected by hand with `PATCH /chapters/{id}`,
+    which is the interface's job to say and not this route's to forbid.
+
+    What it refuses, and why each is a 409 rather than a 400: the request is
+    well-formed every time and conflicts with state that already exists.
+
+      the memoir is published  nothing about a sealed memoir changes
+      the edit emptied it      a plan with no chapters is not a plan
+
+    A chapter id the plan does not hold is a 400: that is a malformed request
+    rather than a conflict, and it usually means the screen is looking at a
+    plan that has since been regenerated.
+    """
+    try:
+        plan = await edit_plan(str(memoir_id), user.id, update.model_dump()["chapters"])
+    except NoPlanYet:
+        raise HTTPException(
+            status_code=404,
+            detail="this memoir has not been planned yet",
+        )
+    except PlanSealed:
+        raise HTTPException(
+            status_code=409,
+            detail="a published memoir cannot be replanned",
+        )
+    except NothingLeft:
+        raise HTTPException(
+            status_code=409,
+            detail="a plan needs at least one chapter with something in it",
+        )
+    except UnknownChapter as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+
+    return plan
+
+
+# ---------------------------------------------------------------------------
 # Making the book in the first place
 # ---------------------------------------------------------------------------
 
@@ -193,17 +340,25 @@ async def get_owner_reading(memoir_id: UUID, user: CurrentUser = Depends(current
 async def post_assemble(
     memoir_id: UUID, user: CurrentUser = Depends(current_user)
 ):
-    """Turn everything in the archive into chapters. Owner only.
+    """Write the stored plan into the memoir's chapters. Owner only.
 
     Bearer only, with no link path at all — this is the one route in the file
     that writes the book rather than reading it, and a share token is not
     permission to rewrite somebody's memoir.
 
-    200 rather than 201: running it again replaces what was there, so it is not
-    creating a resource at an address the caller did not already have.
+    Fast now, and no model call: `POST /plan` did that part and this reads the
+    row. 200 rather than 201: running it again replaces what was there, so it
+    is not creating a resource at an address the caller did not already have.
     """
     try:
         result = await assemble(str(memoir_id), user.id)
+    except NoPlanYet:
+        # Not an error about the memoir — an order-of-operations answer. The
+        # frontend shows the plan button, which is the thing to do next.
+        raise HTTPException(
+            status_code=409,
+            detail="plan the memoir before assembling it",
+        )
     except NothingToAssemble:
         # The memoir is real and it is theirs, it is simply empty. 400 with
         # something the frontend can show, rather than the 404 below — telling
@@ -341,6 +496,75 @@ async def get_one_chapter(
     if chapter is None:
         raise HTTPException(status_code=404, detail="chapter not found")
     return chapter
+
+
+@router.patch("/chapters/{chapter_id}", response_model=Chapter)
+async def patch_chapter(
+    chapter_id: UUID,
+    edit: ChapterEdit,
+    user: CurrentUser = Depends(current_user),
+):
+    """Correct one page of the book by hand. Owner only, and only before sealing.
+
+    Bearer token and no link path, unlike the `GET` above. A share token is
+    permission to read somebody's memoir, never to change what it says.
+
+    Rename the chapter, reword a passage, reorder the page, move a photograph
+    to another paragraph or another placement, or leave any of it out. What the
+    owner cannot do here is write a new passage — prose with no `block_source`
+    behind it is a fabricated one — or move a passage into a different chapter,
+    which is the plan's job.
+
+    **Every edited passage is re-surveyed.** A source's span is character
+    offsets into the block's text, so changing the words moves them; each span
+    is re-found by the substring it covered, and falls back to crediting the
+    whole paragraph when the words are gone or now appear twice. The credit
+    stays true and only its precision is lost, which is the trade
+    `planner.verify` already makes for the same reason.
+
+    The codes, and why each one:
+
+      404  not this owner's chapter, or no such chapter. Never 403 — this API
+           does not confirm that a stranger's memoir exists
+      409  the memoir is published. Immutable is immutable; the whole comment
+           layer is anchored into these characters
+      409  the edit removed every passage, which would take the chapter's
+           photographs with it through the anchor cascade
+      400  a passage id this chapter does not hold, a blank passage, or a
+           photograph pointed at something that is not a surviving paragraph
+    """
+    try:
+        edited = await edit_chapter(
+            str(chapter_id),
+            user.id,
+            title=edit.title,
+            blocks=(
+                None
+                if edit.blocks is None
+                else [block.model_dump() for block in edit.blocks]
+            ),
+        )
+    except MemoirSealed:
+        raise HTTPException(
+            status_code=409,
+            detail="a published memoir cannot be edited",
+        )
+    except PageEmptied:
+        raise HTTPException(
+            status_code=409,
+            detail="a chapter needs at least one passage",
+        )
+    except (UnknownBlock, EmptyPassage, BadAnchor) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not edited:
+        raise HTTPException(status_code=404, detail="chapter not found")
+
+    # Read it back rather than assembling a response here: the page the owner
+    # is now looking at includes freshly signed photograph URLs and the credit
+    # lines joined from the archive, and `get_chapter` is the one place that
+    # knows how to produce all of it.
+    return await get_chapter(str(chapter_id), user_id=user.id)
 
 
 # ---------------------------------------------------------------------------

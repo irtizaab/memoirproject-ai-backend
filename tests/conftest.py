@@ -57,6 +57,18 @@ os.environ["PUBLIC_BASE_URL"] = ""
 # proves `/dev/signin` cannot be reached by guessing the path.
 os.environ["ENABLE_DEV_ROUTES"] = "false"
 
+# The model is off for the whole suite, and this is not a detail.
+#
+# `Settings` reads `.env`, so without this line a developer's real
+# `GEMINI_API_KEY` reaches the tests and every assembly test makes a live,
+# billed call to Google — which is also why the fallback assertions used to
+# pass for the wrong reason: they were relying on that call *failing*.
+#
+# Tests that want the planner path stub it explicitly, on the consumer's own
+# reference. See `tests/api/test_plan.py`.
+os.environ["AI_ENABLED"] = "false"
+os.environ["GEMINI_API_KEY"] = ""
+
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5433/memoir_test",
@@ -110,6 +122,7 @@ MUTABLE_TABLES = [
     "block_source",
     "chapter_block",
     "chapter",
+    "memoir_plan",
     "transcript",
     "media_asset",
     "memory",

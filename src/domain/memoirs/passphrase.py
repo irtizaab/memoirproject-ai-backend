@@ -49,11 +49,6 @@ P = 1
 SALT_BYTES = 16
 KEY_BYTES = 32
 
-# scrypt needs its OpenSSL memory ceiling raised to match n*r*128 or it refuses
-# to run. Computed rather than typed, so changing N above cannot leave a
-# constant behind that makes every hash fail at once.
-_MAXMEM = 128 * N * R * 2
-
 
 class PassphraseTooShort(Exception):
     """The owner chose something that is not worth hashing.

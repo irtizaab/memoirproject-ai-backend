@@ -8,7 +8,6 @@
 
 import logging
 
-import httpx
 import jwt
 from jwt import PyJWKClient
 

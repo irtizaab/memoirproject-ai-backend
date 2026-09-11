@@ -28,11 +28,21 @@
 # Everything below `_plan()` is indifferent to which one ran. `_write_chapter`
 # receives the same shape either way, and `block_source` says the same thing:
 # who said this, and which part of it.
+#
+# ---------------------------------------------------------------------------
+# Two steps, not one
+# ---------------------------------------------------------------------------
+# `generate_plan()` plans and stores; `assemble()` writes what was stored.
+# They used to be one function, which meant the model's decisions about a
+# family's book existed only for the duration of one request and were
+# unreviewable by the person whose book it was. `plan_service.py` owns the row
+# in between. What it changes here: the model call is in `generate_plan`, and
+# `assemble` is Postgres from end to end and back to a single transaction.
 
 import logging
 from datetime import date
 
-from src.domain.chapters import planner
+from src.domain.chapters import plan_service, planner
 from src.domain.memoirs.access import owned_memoir
 from src.integrations.db import db
 
@@ -123,6 +133,42 @@ async def _memories(cur, memoir_id: str) -> list[dict]:
           JOIN memoir_participant p ON p.id = m.participant_id
          WHERE m.memoir_id = %(memoir_id)s
          ORDER BY m.happened_on NULLS LAST, m.created_at
+        """,
+        {"memoir_id": memoir_id},
+    )
+    return await cur.fetchall()
+
+
+async def _photographs(cur, memoir_id: str) -> list[dict]:
+    """Every uploaded photograph in the memoir, in the archive's own order.
+
+    Separate from `_memories` and not a join, because the relationship is
+    one-to-many in the direction that matters: a memory can hold several
+    photographs, and the planner is being asked about each one. Folding them
+    into the memory rows would either lose all but the first — which is what
+    `image_asset_id` does, and why it is only the fallback now — or repeat
+    every memory's words once per picture.
+
+    `uploaded_at IS NOT NULL` is the difference between a photograph and a
+    reservation nobody completed. `storage_path` is here because the planner
+    has to fetch the bytes; it never leaves the domain layer, and no response
+    model in this product carries it.
+
+    Ordered by the memory the photograph came with, so the list the model is
+    shown runs in the same direction as the archive it is reading.
+    """
+    await cur.execute(
+        """
+        SELECT a.id,
+               a.memory_id,
+               a.storage_path,
+               a.mime_type
+          FROM media_asset a
+          JOIN memory m ON m.id = a.memory_id
+         WHERE a.memoir_id = %(memoir_id)s
+           AND a.kind = 'image'
+           AND a.uploaded_at IS NOT NULL
+         ORDER BY m.happened_on NULLS LAST, m.created_at, a.created_at
         """,
         {"memoir_id": memoir_id},
     )
@@ -252,6 +298,11 @@ def _plan_by_date(memories: list[dict]) -> list[dict]:
                     "through_year": max(years),
                     "blocks": _blocks_verbatim(held),
                     "memories": held,
+                    # The date assembler has no opinion about photographs. An
+                    # empty list rather than a missing key, so `_write_chapter`
+                    # has one shape to read and the positional rule below is
+                    # reached by being empty rather than by being absent.
+                    "figures": [],
                 }
             )
 
@@ -263,30 +314,38 @@ def _plan_by_date(memories: list[dict]) -> list[dict]:
                 "through_year": None,
                 "blocks": _blocks_verbatim(undated),
                 "memories": undated,
+                "figures": [],
             }
         )
 
     return chapters
 
 
-async def _plan(memories: list[dict], memoir: dict) -> list[dict]:
-    """Chapters in reading order. The whole of the "organising" step.
+async def _plan(
+    memories: list[dict], memoir: dict, photographs: list[dict] | None = None
+) -> tuple[list[dict], str]:
+    """Chapters in reading order, and which assembler produced them.
 
-    The dispatcher, and the only thing the model call replaced. It asks the
-    planner to read the archive, and falls back to `_plan_by_date` whenever it
-    cannot — see `domain/chapters/planner.py`, which returns None rather than
-    raising for exactly this reason.
+    The dispatcher. It asks the planner to read the archive, and falls back to
+    `_plan_by_date` whenever it cannot — see `domain/chapters/planner.py`,
+    which returns None rather than raising for exactly this reason.
 
     The two plans differ in what a paragraph *is*. The planner composes prose
     from several memories and quotes itself so the offsets can be verified;
     the fallback prints one person's words unedited and attributes them whole.
     The reader renders both identically, because `block_source` says the same
     thing either way: who said this, and which part of it.
+
+    The second element is the only thing that tells them apart afterwards.
+    Without it a decade-banded book and a planned one are indistinguishable
+    once written, which meant a deployment with no `GEMINI_API_KEY` produced
+    the fallback for every memoir and said nothing about it — to the owner or
+    to anybody reading the logs.
     """
-    planned = await planner.plan(memories, memoir, _prose)
+    planned = await planner.plan(memories, memoir, _prose, photographs or [])
     if planned is not None:
-        return planned
-    return _plan_by_date(memories)
+        return planned, "planner"
+    return _plan_by_date(memories), "by_date"
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +386,11 @@ async def _write_chapter(cur, memoir_id: str, ordinal: int, planned: dict) -> di
 
     next_ordinal = 0
     last_paragraph_id: str | None = None
+    # memory id -> the first paragraph that quoted it. This is how a planned
+    # figure's `anchor_memory_id` becomes a real `anchor_block_id`: the model
+    # names a memory, and the row is resolved here from what was actually
+    # written, never from anything the model said about position.
+    paragraph_for: dict[str, str] = {}
     written = {"blocks": 0, "sources": 0, "figures": 0}
 
     for block in planned["blocks"]:
@@ -355,6 +419,8 @@ async def _write_chapter(cur, memoir_id: str, ordinal: int, planned: dict) -> di
         # margin would be captioned by a fragment.
         if block["kind"] == "paragraph":
             last_paragraph_id = block_id
+            for source in block["sources"]:
+                paragraph_for.setdefault(str(source["memory_id"]), block_id)
 
         # The offsets arrive already checked. `planner.verify` computed each
         # one with `str.find` against this exact text and dropped anything it
@@ -383,27 +449,21 @@ async def _write_chapter(cur, memoir_id: str, ordinal: int, planned: dict) -> di
             )
             written["sources"] += 1
 
-    photographs = [
-        memory
-        for memory in planned["memories"]
-        if memory["image_asset_id"] is not None
-    ]
+    async def place(asset_id, placement: str, anchor: str | None) -> bool:
+        """Write one figure. False if there was nothing to anchor it to.
 
-    for position, memory in enumerate(photographs):
-        if last_paragraph_id is None:
+        A photograph whose chapter contains no prose is skipped rather than
+        stored: `block_figure_shape` makes `anchor_block_id` NOT NULL, and the
+        alternative — anchoring it to a paragraph elsewhere in the life —
+        would caption it with somebody else's afternoon.
+        """
+        nonlocal next_ordinal
+        if anchor is None:
             logger.info(
-                "Chapter %s has photographs but no prose; %s not placed",
+                "Chapter %s has a photograph but no prose to anchor it to",
                 chapter_id,
-                memory["id"],
             )
-            continue
-
-        # The first photograph in a chapter runs full measure, the rest sit in
-        # the margin. A rule, not a judgement — the reader supports exactly two
-        # placements and something has to choose. The Claude call will choose
-        # better, by looking at whether the photograph *is* the moment the
-        # paragraph describes.
-        placement = "inset" if position == 0 else "margin"
+            return False
 
         await cur.execute(
             """
@@ -417,49 +477,76 @@ async def _write_chapter(cur, memoir_id: str, ordinal: int, planned: dict) -> di
                 "memoir_id": memoir_id,
                 "chapter_id": chapter_id,
                 "ordinal": next_ordinal,
-                "asset_id": memory["image_asset_id"],
+                "asset_id": asset_id,
                 "placement": placement,
-                "anchor": last_paragraph_id,
+                "anchor": anchor,
             },
         )
         next_ordinal += 1
         written["figures"] += 1
+        return True
+
+    planned_figures = planned.get("figures") or []
+
+    if planned_figures:
+        # The model looked at the photographs and said where each belongs.
+        # Every asset id and anchor here has already been checked against the
+        # archive by `planner.verify_figures`, and the anchor is resolved to a
+        # row written moments ago rather than to anything it claimed about
+        # order. `placement` includes 'carousel': several figures sharing one
+        # anchor with that placement are one carousel, in the order below.
+        for figure in planned_figures:
+            await place(
+                figure["asset_id"],
+                figure["placement"],
+                paragraph_for.get(str(figure["anchor_memory_id"]))
+                or last_paragraph_id,
+            )
+    else:
+        # No figure decisions, which means the date assembler ran, or the model
+        # placed nothing. One photograph per memory that has one, the first
+        # full measure and the rest in the margin. A rule rather than a
+        # judgement, and the reason it is still here: a book divided by decade
+        # with its photographs in the margin is a book.
+        fallback = [
+            memory
+            for memory in planned["memories"]
+            if memory["image_asset_id"] is not None
+        ]
+        for position, memory in enumerate(fallback):
+            await place(
+                memory["image_asset_id"],
+                "inset" if position == 0 else "margin",
+                last_paragraph_id,
+            )
 
     return written
 
 
-async def assemble(memoir_id: str, user_id: str) -> dict | None:
-    """Rebuild a draft memoir's chapters from everything in its archive.
+async def generate_plan(memoir_id: str, user_id: str) -> dict | None:
+    """Read the archive, decide what the book is, and store the plan.
 
-    Returns a tally of what was written, None if the memoir is not this user's.
+    Returns the plan as the owner reads it, None if the memoir is not theirs.
     Raises NothingToAssemble on an empty archive and MemoirSealed on a
     published one.
 
-    ---------------------------------------------------------------------
-    Why this replaces rather than appends
-    ---------------------------------------------------------------------
-    Assembly is re-runnable while the memoir is a draft, because the owner will
-    add memories and want the book to include them. Appending would duplicate
-    every existing paragraph, so the previous chapters are deleted first and
-    the whole book is rebuilt from the archive as it stands.
-
-    The DELETE cascades to `chapter_block`, `block_source` and `comment_thread`
-    — everything downstream of a chapter. Comments are the only loss that would
-    matter, and a draft cannot have any: reaching the comment routes needs a
-    live *view* link, and a view link is issued at publication.
+    This is the expensive half of what `assemble()` used to be, and it is now
+    the only half that calls a model. Nothing downstream of the archive is
+    written: the plan is a draft, the owner is expected to read it, and
+    running this again replaces it.
 
     ---------------------------------------------------------------------
-    Why the writes are one transaction and the planning is not
+    Why the model call sits between two transactions
     ---------------------------------------------------------------------
-    Everything that touches `chapter` happens in a single transaction, for the
-    reason `claim_draft` gives at length: a memoir left holding half of one
-    assembly and half of another is a book with paragraphs missing and no code
-    path that would ever notice.
+    Planning an archive can take minutes, and a Postgres connection held open
+    across an HTTP call to another service is how a bounded pool dies — the
+    same reason signed storage URLs are minted outside their transaction in
+    `media_service`. So it sits between two, and the second one re-checks
+    ownership and `status` before it writes anything.
 
-    The model call cannot be inside it. Planning an archive can take minutes,
-    and a Postgres connection held open across an HTTP call to another service
-    is how a bounded pool dies. So it sits between two transactions, and the
-    second one re-checks ownership and `status` before it writes anything.
+    The cost is that a memoir published in between is planned and then
+    discarded. That is the right way round: the alternative is a sealed memoir
+    with a fresh plan attached to it, inviting an assembly that can never run.
     """
     async with db() as conn, conn.cursor() as cur:
         memoir = await owned_memoir(cur, memoir_id, user_id)
@@ -478,15 +565,9 @@ async def assemble(memoir_id: str, user_id: str) -> dict | None:
         if not any(_prose(memory) for memory in memories):
             raise NothingToAssemble
 
-    # Planning happens outside the transaction, because it may make an HTTP
-    # call to Gemini that takes minutes. Holding a Postgres connection open
-    # across that is how a bounded pool dies — the same reason signed storage
-    # URLs are minted outside their transaction in `media_service`.
-    #
-    # The cost is that a memoir published in between is assembled and then
-    # discarded: the second transaction re-checks `status` under the same lock
-    # that does the writing, so nothing reaches a sealed memoir.
-    planned = await _plan(memories, memoir)
+        photographs = await _photographs(cur, memoir_id)
+
+    planned, organised_by = await _plan(memories, memoir, photographs)
 
     async with db() as conn, conn.cursor() as cur:
         memoir = await owned_memoir(cur, memoir_id, user_id)
@@ -498,7 +579,81 @@ async def assemble(memoir_id: str, user_id: str) -> dict | None:
         # Belt and braces. The archive had prose a moment ago, so this only
         # fires if a plan came back with every block dropped — which `planner`
         # already guards against by falling back. Cheaper to check than to
-        # explain a memoir with zero chapters and a 200.
+        # explain a plan with zero chapters and a 200.
+        if not any(chapter["blocks"] for chapter in planned):
+            raise NothingToAssemble
+
+        await plan_service.store(cur, memoir_id, planned, organised_by)
+        row = await plan_service.load(cur, memoir_id)
+
+    logger.info(
+        "Planned memoir %s into %s chapters, organised by %s",
+        memoir_id,
+        len(planned),
+        organised_by,
+    )
+    return plan_service.summarise(row)
+
+
+async def assemble(memoir_id: str, user_id: str) -> dict | None:
+    """Write the stored plan into the memoir's chapters.
+
+    Returns a tally of what was written, None if the memoir is not this user's.
+    Raises NoPlanYet when nothing has planned the memoir, NothingToAssemble
+    when every block in the stored plan cites memories that have since been
+    deleted, and MemoirSealed on a published memoir.
+
+    ---------------------------------------------------------------------
+    Why this is one transaction again
+    ---------------------------------------------------------------------
+    It used to be two, with a model call in the gap. The model call moved to
+    `generate_plan`, so everything left here is a read of the archive, a read
+    of one row, and the writes — all of it Postgres, all of it fast. Holding a
+    single connection for the whole of it is now the simplest correct thing,
+    and it closes the window in which a memoir could be published between
+    planning and writing.
+
+    Everything that touches `chapter` happens in that one transaction, for the
+    reason `claim_draft` gives at length: a memoir left holding half of one
+    assembly and half of another is a book with paragraphs missing and no code
+    path that would ever notice.
+
+    ---------------------------------------------------------------------
+    Why this replaces rather than appends
+    ---------------------------------------------------------------------
+    Assembly is re-runnable while the memoir is a draft, because the owner will
+    add memories, regenerate the plan, and want the book to include them.
+    Appending would duplicate every existing paragraph, so the previous
+    chapters are deleted first and the whole book is rebuilt from the plan.
+
+    The DELETE cascades to `chapter_block`, `block_source` and `comment_thread`
+    — everything downstream of a chapter. Comments are the only loss that would
+    matter, and a draft cannot have any: reaching the comment routes needs a
+    live *view* link, and a view link is issued at publication.
+    """
+    async with db() as conn, conn.cursor() as cur:
+        memoir = await owned_memoir(cur, memoir_id, user_id)
+        if memoir is None:
+            return None
+
+        if memoir["status"] == "published":
+            raise MemoirSealed
+
+        row = await plan_service.load(cur, memoir_id)
+        if row is None:
+            raise plan_service.NoPlanYet
+
+        stored = plan_service.summarise(row)
+
+        # The archive is re-read rather than taken from the plan, so the book
+        # is built from the memories as they stand now and not as they stood
+        # when the model read them. `rehydrate` drops anything that has gone.
+        memories = await _memories(cur, memoir_id)
+        photographs = await _photographs(cur, memoir_id)
+        planned = plan_service.rehydrate(
+            {"chapters": stored["chapters"]}, memories, photographs
+        )
+
         if not any(chapter["blocks"] for chapter in planned):
             raise NothingToAssemble
 
@@ -507,7 +662,13 @@ async def assemble(memoir_id: str, user_id: str) -> dict | None:
             {"memoir_id": memoir_id},
         )
 
-        tally = {"chapters": 0, "blocks": 0, "sources": 0, "figures": 0}
+        tally = {
+            "chapters": 0,
+            "blocks": 0,
+            "sources": 0,
+            "figures": 0,
+            "organised_by": stored["organised_by"],
+        }
         ordinal = 0
         for chapter in planned:
             # A chapter that ended up with no prose is not created at all: its
@@ -520,6 +681,8 @@ async def assemble(memoir_id: str, user_id: str) -> dict | None:
             tally["chapters"] += 1
             for key in ("blocks", "sources", "figures"):
                 tally[key] += written[key]
+
+        await plan_service.mark_assembled(cur, memoir_id)
 
     logger.info(
         "Assembled memoir %s into %s chapters (%s blocks, %s figures)",

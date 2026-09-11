@@ -203,6 +203,50 @@ async def object_size(path: str) -> int:
     return int(length)
 
 
+async def download_object(path: str, *, max_bytes: int | None = None) -> bytes:
+    """The object's bytes, read with this service's own credentials.
+
+    The one place in this codebase where media travels *through* the API
+    rather than past it, and it exists for one caller: the assembly planner,
+    which has to put a photograph in front of a model. Everything a browser
+    touches still uses a signed URL and goes direct — see
+    `create_signed_download_url`, and the product rule that bytes do not pass
+    through here.
+
+    So this is deliberately not a general-purpose download. `max_bytes`
+    refuses an object bigger than the caller is prepared to hold, checked
+    against the `Content-Length` before the body is read, because the point of
+    a cap that only fires after buffering 90 MB is hard to name.
+
+    Raises StorageError for a missing object, an unreachable bucket, or an
+    object over the cap. The caller decides whether one unusable photograph is
+    worth failing the whole request over; for the planner it is not.
+    """
+    bucket = settings.supabase_storage_bucket
+    url = f"{settings.supabase_storage_url}/object/{bucket}/{path}"
+
+    try:
+        response = await (await client()).get(
+            url, headers=_headers(), timeout=30.0
+        )
+    except httpx.HTTPError as exc:
+        raise StorageError(f"could not reach storage: {exc}") from exc
+
+    if response.status_code >= 400:
+        raise StorageError(f"no object at that path ({response.status_code})")
+
+    if max_bytes is not None:
+        declared = response.headers.get("content-length")
+        if declared is not None and int(declared) > max_bytes:
+            raise StorageError(
+                f"object is {declared} bytes, over the {max_bytes} cap"
+            )
+        if len(response.content) > max_bytes:
+            raise StorageError("object is over the cap")
+
+    return response.content
+
+
 async def delete_object(path: str) -> None:
     """Remove an object. Used when its memory is deleted.
 

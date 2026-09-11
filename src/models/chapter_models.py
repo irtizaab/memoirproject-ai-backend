@@ -26,7 +26,12 @@ BlockKind = Literal["paragraph", "pull", "figure"]
 
 # The `figure_placement` enum. Chosen by the assembly step, never by a client —
 # it is on the response models only.
-FigurePlacement = Literal["margin", "inset"]
+#
+# `carousel` (migration 0016) is several photographs of one moment shown in
+# turn: the figures sharing an `anchor_block_id` with this placement are one
+# carousel, in `ordinal` order. There is no carousel row — the grouping is the
+# anchor, which the schema was already enforcing.
+FigurePlacement = Literal["margin", "inset", "carousel"]
 
 
 class BlockSource(BaseModel):
@@ -289,13 +294,171 @@ class CommentReceipt(BaseModel):
     thread: CommentThread
 
 
-class AssemblyResult(BaseModel):
-    """What assembling an archive into chapters actually produced.
+# Which of the two assemblers organised a plan. `planner` is the model reading
+# the archive; `by_date` is the decade fallback in `assembly_service`. Mirrors
+# the CHECK constraint in migration 0015.
+#
+# Response-only, like `FigurePlacement`: it is a fact about what happened, not
+# a setting. An owner who wants the other one does not ask for it by name —
+# they fix the deployment, because `by_date` means the model could not run.
+PlanOrigin = Literal["planner", "by_date"]
 
-    Four counts and nothing else. The owner is about to be told a number and it
-    should be the real one — "8 chapters, 41 paragraphs" is a fact about their
-    archive, not a score, and it is deliberately not a percentage of anything.
-    A memoir has no denominator.
+
+class PlannedSource(BaseModel):
+    """One memory a planned block drew on, and which words came from it.
+
+    The plan's twin of `BlockSource`, and thinner: it names the memory but not
+    the person. `participant_id` is read from the archive when the plan is
+    assembled and is never carried in the document, for the same reason
+    `planner.verify` refuses to take it from the model — the row knows who left
+    a memory and nothing else is entitled to an opinion.
+    """
+
+    memory_id: UUID
+    start_offset: int | None = None
+    end_offset: int | None = None
+    diverges: bool = False
+
+
+class PlannedBlock(BaseModel):
+    """One paragraph or pulled line in the plan, before it is a row.
+
+    `index` is the passage's position in the chapter as it was stored, and it
+    is how an edit says which passage it means. A passage has no id — it is
+    not a row yet — and it cannot be matched by its text, because the text is
+    the thing being edited.
+
+    It is not the reading order. Order is array position in the request, so
+    moving a passage means sending it earlier with the same `index`.
+    """
+
+    index: int | None = None
+    kind: Literal["paragraph", "pull"]
+    text: str
+    sources: list[PlannedSource] = Field(default_factory=list)
+
+
+class PlannedFigure(BaseModel):
+    """Where the model decided one photograph belongs.
+
+    Named in the model's own vocabulary rather than in rows: an asset, and the
+    memory whose paragraph it sits beside. The blocks it will actually anchor
+    to do not exist until the plan is assembled, and are different rows on
+    every run — so storing a block id here would be storing something that is
+    only true for one assembly.
+    """
+
+    asset_id: UUID
+    anchor_memory_id: UUID
+    placement: FigurePlacement
+
+
+class PlannedChapter(BaseModel):
+    """One chapter of the plan: what it is called and what is in it.
+
+    `id` is minted when the plan is stored and is how the owner's screen names
+    a chapter to rename or move. It belongs to this plan only — regenerating
+    produces new chapters with new ids, because they are new chapters.
+    """
+
+    id: UUID
+    title: str
+    from_year: int | None = None
+    through_year: int | None = None
+    blocks: list[PlannedBlock] = Field(default_factory=list)
+    figures: list[PlannedFigure] = Field(default_factory=list)
+    memory_ids: list[UUID] = Field(default_factory=list)
+
+
+class MemoirPlan(BaseModel):
+    """The plan as the owner reads it, before the book is written.
+
+    The one place in this file whose audience is *only* the owner — a plan is
+    reachable by bearer token and by no link, so unlike everything else here
+    there is no forwarded-link question to answer about any field.
+
+    `assembled_at` is what the frontend reads to know whether it is showing a
+    draft or a record of what the book was built from. `edited_at` is what it
+    reads to know whether regenerating would throw away somebody's evening.
+    """
+
+    organised_by: PlanOrigin
+    generated_at: datetime
+    edited_at: datetime | None = None
+    assembled_at: datetime | None = None
+    chapters: list[PlannedChapter] = Field(default_factory=list)
+
+
+class PlanUpdate(BaseModel):
+    """Body of PATCH /memoirs/{id}/plan — the corrected plan, whole.
+
+    The whole chapter list rather than a patch of it, because order is one of
+    the things being edited and an ordinal sent by a client is a number the
+    server would have to trust. Array position *is* the order here, renumbered
+    server-side.
+
+    Chapters may be dropped — leaving one out is how the owner removes it — but
+    not invented: every id has to be one the stored plan already holds. That
+    asymmetry is the point. A stale screen can lose a chapter the owner chose
+    to lose; it cannot conjure one nobody wrote.
+    """
+
+    chapters: list[PlannedChapter] = Field(
+        min_length=1,
+        description="the chapters to keep, in reading order",
+    )
+
+
+class BlockEdit(BaseModel):
+    """One block of an assembled chapter, as the owner left it.
+
+    Everything except `id` is optional and means "unchanged". The id is how the
+    server finds the row: a block this chapter does not hold is refused rather
+    than created, because prose with no `block_source` behind it is a
+    fabricated paragraph and this path has no archive to attribute one to.
+
+    `text` is for a paragraph or a pulled line; `placement` and
+    `anchor_block_id` are for a photograph. Sending the wrong one for the kind
+    is ignored rather than an error — the shape is settled by the database's
+    two CHECK constraints, and the owner is editing a page, not filling a form.
+    """
+
+    id: UUID
+    text: str | None = None
+    placement: FigurePlacement | None = None
+    anchor_block_id: UUID | None = None
+
+
+class ChapterEdit(BaseModel):
+    """Body of PATCH /chapters/{id} — one page of the book, corrected by hand.
+
+    The whole block list rather than a patch of it, for the same reason
+    `PlanUpdate` takes the whole chapter list: order is one of the things being
+    edited, and array position is the order, renumbered server-side. An ordinal
+    a client sends is the one number two open tabs are guaranteed to disagree
+    about.
+
+    `blocks` omitted leaves the page exactly as it is, so renaming a chapter
+    touches no prose and no character offset. `blocks` given is a complete
+    statement of what the chapter holds: anything left out is removed.
+
+    What this cannot do is add a passage or move one to another chapter. The
+    first would be prose with nobody behind it; the second is the plan's job,
+    where which chapter a memory belongs in is still a decision rather than a
+    row.
+    """
+
+    title: str | None = None
+    blocks: list[BlockEdit] | None = None
+
+
+class AssemblyResult(BaseModel):
+    """What assembling a plan into chapters actually produced.
+
+    Four counts and where the organisation came from. The owner is about to be
+    told a number and it should be the real one — "8 chapters, 41 paragraphs"
+    is a fact about their archive, not a score, and it is deliberately not a
+    percentage of anything. A memoir has no denominator.
 
     `figures` can legitimately be lower than the number of photographs in the
     archive: a photograph in a chapter with no prose has no paragraph to sit
@@ -306,6 +469,7 @@ class AssemblyResult(BaseModel):
     blocks: int
     sources: int
     figures: int
+    organised_by: PlanOrigin
 
 
 class ReaderOpen(BaseModel):

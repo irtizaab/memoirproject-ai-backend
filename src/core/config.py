@@ -134,7 +134,12 @@ class Settings(BaseSettings):
     # by hand, on far more material, and the judgement it needs is the whole
     # point of the call — so the more capable tier, and a setting rather than a
     # constant so it can be changed without a deploy.
-    gemini_assembly_model: str = "gemini-2.5-pro"
+    #
+    # Not a `-pro-preview`: the preview tiers carry a free-tier quota of zero,
+    # so every plan came back 429, `planner.plan()` turned that into None, and
+    # the book was organised by decade. Check the quota before raising the tier
+    # here — a model that exists is not a model this key may call.
+    gemini_assembly_model: str = "gemini-3.5-flash"
 
     # The kill switch, mirroring `transcription_enabled`. Set false and
     # contributors simply get no follow-up question, and assembly falls back to

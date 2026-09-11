@@ -35,10 +35,14 @@ from src.integrations.db import db
 
 logger = logging.getLogger(__name__)
 
-# The dictionary every expression index in migration 0013 was built with.
-# Changing it here without changing them there does not break correctness — it
-# silently stops the indexes being used, which is worse, because it looks fine.
-DICTIONARY = "english"
+# Every query below spells the dictionary as the literal `'english'`, and it
+# has to. Migration 0013's expression indexes were built with that literal, and
+# an index on `to_tsvector('english', text)` does not match a query that passes
+# the configuration as a parameter — the search would keep working and silently
+# stop using the indexes, which is worse than breaking, because it looks fine.
+#
+# There was a `DICTIONARY = "english"` constant here promising to be the single
+# place to change it. Nothing referenced it.
 
 # Delimiters `ts_headline` wraps a match in.
 #
