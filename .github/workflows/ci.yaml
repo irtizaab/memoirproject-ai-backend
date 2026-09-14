@@ -1,4 +1,7 @@
-# Example CI workflow: shows where automated checks (tests, linting) would run on push.
+# The suite in tests/ configures its own environment (tests/conftest.py sets
+# every variable before src is imported, applies migrations/ to a fresh
+# database, and refuses any database not named memoir_test*). All this job
+# supplies is a Postgres to point it at.
 
 name: CI
 
@@ -9,12 +12,28 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: memoir_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - run: echo "Add test/lint commands here"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q -p no:warnings
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/memoir_test
