@@ -141,6 +141,14 @@ class Settings(BaseSettings):
     # here — a model that exists is not a model this key may call.
     gemini_assembly_model: str = "gemini-3.5-flash"
 
+    # --- Groq -----------------------------------------------------------
+    # A second provider behind the same `generate()`. Either model setting
+    # above may name a Groq model with a `groq:` prefix —
+    # `GEMINI_MODEL=groq:openai/gpt-oss-120b` — and that call goes to Groq
+    # with this key instead. Same size of secret as the Gemini one, confined to
+    # the same module.
+    groq_api_key: str | None = None
+
     # The kill switch, mirroring `transcription_enabled`. Set false and
     # contributors simply get no follow-up question, and assembly falls back to
     # grouping by decade. Nothing fails and nothing is spent.

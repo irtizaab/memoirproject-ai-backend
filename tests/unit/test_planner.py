@@ -9,11 +9,16 @@
 # No network, no key, no database.
 
 from src.domain.chapters.planner import (
+    Finding,
     Plan,
     PlannedBlock,
     PlannedChapter,
     PlannedSource,
+    Review,
+    _accept_revision,
     _clean,
+    _findings,
+    _shape,
     verify,
 )
 
@@ -137,7 +142,7 @@ def test_a_block_with_no_valid_source_is_dropped():
         ]
     )
 
-    [chapter] = _clean(plan, _memories())
+    [chapter], _ = _clean(plan, _memories())
 
     assert len(chapter["blocks"]) == 1
     assert chapter["blocks"][0]["text"] == TEXT
@@ -154,7 +159,7 @@ def test_a_chapter_left_with_nothing_is_dropped():
         ]
     )
 
-    assert _clean(plan, _memories()) == []
+    assert _clean(plan, _memories())[0] == []
 
 
 def test_an_unknown_block_kind_becomes_a_paragraph():
@@ -174,7 +179,7 @@ def test_an_unknown_block_kind_becomes_a_paragraph():
         ]
     )
 
-    [chapter] = _clean(plan, _memories())
+    [chapter], _ = _clean(plan, _memories())
     assert chapter["blocks"][0]["kind"] == "paragraph"
 
 
@@ -191,6 +196,102 @@ def test_only_cited_memories_are_carried_to_the_figure_pass():
         ]
     )
 
-    [chapter] = _clean(plan, _memories())
+    [chapter], _ = _clean(plan, _memories())
 
     assert [m["id"] for m in chapter["memories"]] == ["mem-b"]
+
+
+# ---------------------------------------------------------------------------
+# What the reviewer is allowed to change
+# ---------------------------------------------------------------------------
+
+
+def _chapter():
+    return {"title": "The house", "blocks": [{"kind": "paragraph", "text": TEXT}]}
+
+
+def test_a_revision_that_loses_attribution_is_refused():
+    """A re-worded paragraph can lose the quote that attributed it.
+
+    The reviewer is asked to remove and re-word, never to add — but a model
+    that drops a source while re-wording has made the book worse in the one
+    way this product cannot tolerate. The measure is the tally: no more
+    unattributed blocks than the draft had.
+    """
+    draft = {"blocks": 3, "unattributed": 0}
+    worse = {"blocks": 3, "unattributed": 1}
+    assert _accept_revision(draft, [_chapter()], worse) is False
+
+
+def test_a_revision_with_no_chapters_is_refused():
+    """Removing everything is not a correction."""
+    assert _accept_revision({"unattributed": 2}, [], {"unattributed": 0}) is False
+
+
+def test_a_revision_that_attributes_as_well_is_taken():
+    draft = {"unattributed": 1}
+    assert _accept_revision(draft, [_chapter()], {"unattributed": 1}) is True
+    assert _accept_revision(draft, [_chapter()], {"unattributed": 0}) is True
+
+
+def test_a_finding_is_not_fixed_by_a_revision_that_was_not_taken():
+    """`fixed` is a claim about the revised plan. No revision, no fix."""
+    review = Review(
+        findings=[
+            Finding(kind="attribution", note="A date nobody wrote.", fixed=True),
+            Finding(kind="made-up", chapter="  ", note="  ", fixed=True),
+        ]
+    )
+
+    stored = _findings(review, revised=False)
+
+    assert stored == {
+        "revised": False,
+        "findings": [
+            {
+                "kind": "attribution",
+                "chapter": None,
+                "note": "A date nobody wrote.",
+                "fixed": False,
+            }
+        ],
+    }
+
+
+def test_an_unknown_finding_kind_becomes_structure():
+    """The frontend groups by a closed set; the model does not always use it."""
+    review = Review(findings=[Finding(kind="vibes", note="Odd ordering.")])
+    assert _findings(review, revised=True)["findings"][0]["kind"] == "structure"
+
+
+# ---------------------------------------------------------------------------
+# What the guide is allowed to know
+# ---------------------------------------------------------------------------
+
+
+def test_the_guide_sees_counts_and_never_words():
+    """The guide talks to the owner and has read nothing a family wrote.
+
+    Everything it is told about the archive comes through `_shape`, so this
+    is the whole surface: if a memory's text ever appears here, a third model
+    call has been handed prose it has no need of and nothing to check it
+    against.
+    """
+    memories = [
+        {"id": "a", "participant_id": "p1", "happened_on": "1961-06-01",
+         "body_text": "The back door stuck in summer.", "title": "The house"},
+        {"id": "b", "participant_id": "p2", "happened_on": None,
+         "body_text": "Margaret only ever used the front.", "title": None},
+    ]
+
+    shape = _shape(memories, {"subject_name": "Margaret"})
+
+    assert shape == {
+        "subject": "Margaret",
+        "memories": 2,
+        "dated": 1,
+        "earliest": "1961-06-01",
+        "latest": "1961-06-01",
+        "contributors": 2,
+    }
+    assert "back door" not in str(shape)

@@ -50,6 +50,19 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+# The second provider. Groq speaks OpenAI's chat-completions shape, so it is
+# a different payload against a different URL and the same retry, the same
+# schema rule and the same errors. A model is sent there when its name is
+# written `groq:<model>` in settings — one prefix, no provider switch, and a
+# deployment can put the builder on one and the guide on the other.
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_GROQ_PREFIX = "groq:"
+
+# Groq's vision models look at five images per request and no more. Past that
+# the rest are not sent — logged, and still placed by the caller's fallback
+# rule — where Gemini reads the whole archive.
+_GROQ_MAX_IMAGES = 5
+
 # Statuses worth trying again, and nothing else.
 #
 # 503 UNAVAILABLE is the one that matters: Gemini returns it when the model is
@@ -204,12 +217,13 @@ def _schema_for(model: type[BaseModel]) -> dict:
 
 
 async def _post(
-    model: str,
+    url: str,
+    headers: dict,
     payload: dict,
     timeout: float,
     backoff: tuple[float, ...] = _BACKOFF_SECONDS,
 ) -> httpx.Response:
-    """One request, retried while Gemini is momentarily unavailable.
+    """One request, retried while the provider is momentarily unavailable.
 
     Returns the last response, successful or not — the caller decides what a
     4xx means. Raises `GeminiError` only when the request could not be made at
@@ -229,14 +243,11 @@ async def _post(
             await asyncio.sleep(backoff[attempt - 1])
 
         try:
+            # The key goes in a header, not in the query string. A URL
+            # reaches access logs, proxy logs and error trackers; a header
+            # does not.
             last = await (await client()).post(
-                f"{_BASE_URL}/models/{model}:generateContent",
-                # The key goes in a header, not in the query string. A URL
-                # reaches access logs, proxy logs and error trackers; a header
-                # does not.
-                headers={"x-goog-api-key": settings.gemini_api_key},
-                json=payload,
-                timeout=timeout,
+                url, headers=headers, json=payload, timeout=timeout
             )
         except httpx.HTTPError as exc:
             # A timeout or a dropped connection. Worth one more try for the
@@ -299,10 +310,24 @@ async def generate(
     """
     if not settings.ai_enabled:
         raise GeminiDisabled("AI_ENABLED is false")
-    if not settings.gemini_api_key:
-        raise GeminiDisabled("GEMINI_API_KEY is not set")
 
     chosen = model or settings.gemini_model
+    if chosen.startswith(_GROQ_PREFIX):
+        if not settings.groq_api_key:
+            raise GeminiDisabled("GROQ_API_KEY is not set")
+        return await _generate_groq(
+            chosen[len(_GROQ_PREFIX) :],
+            prompt,
+            schema,
+            system=system,
+            images=images,
+            temperature=temperature,
+            timeout=timeout,
+            backoff=backoff,
+            max_output_tokens=max_output_tokens,
+        )
+    if not settings.gemini_api_key:
+        raise GeminiDisabled("GEMINI_API_KEY is not set")
 
     parts: list[dict] = [{"text": prompt}]
     for mime, raw in images or []:
@@ -336,7 +361,13 @@ async def generate(
     if system:
         payload["systemInstruction"] = {"parts": [{"text": system}]}
 
-    response = await _post(chosen, payload, timeout, backoff)
+    response = await _post(
+        f"{_BASE_URL}/models/{chosen}:generateContent",
+        {"x-goog-api-key": settings.gemini_api_key},
+        payload,
+        timeout,
+        backoff,
+    )
 
     if response.status_code >= 400:
         # The prompt is not logged. It carries what people wrote about someone
@@ -389,6 +420,98 @@ async def generate(
             f"{schema.__name__} (MAX_TOKENS)"
         )
 
+    return _validated(text, schema)
+
+
+async def _generate_groq(
+    model: str,
+    prompt: str,
+    schema: type[T],
+    *,
+    system: str | None,
+    images: list[tuple[str, bytes]] | None,
+    temperature: float,
+    timeout: float,
+    backoff: tuple[float, ...],
+    max_output_tokens: int | None,
+) -> T:
+    """The same call, in OpenAI's chat shape, against Groq.
+
+    The schema goes in `response_format` as JSON Schema proper — Pydantic's
+    own output, `$defs` and `anyOf` included, none of the OpenAPI 3.0 rewriting
+    Gemini needs. Images ride in the user turn as data URLs, first five only.
+    """
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    shown = (images or [])[:_GROQ_MAX_IMAGES]
+    if len(images or []) > len(shown):
+        logger.warning(
+            "Groq looks at %d images per request; %d not sent",
+            _GROQ_MAX_IMAGES,
+            len(images) - len(shown),
+        )
+    for mime, raw in shown:
+        data = base64.b64encode(raw).decode("ascii")
+        content.append(
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+        )
+
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": content})
+
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.__name__,
+                "schema": schema.model_json_schema(),
+            },
+        },
+    }
+    if max_output_tokens is not None:
+        payload["max_completion_tokens"] = max_output_tokens
+
+    response = await _post(
+        _GROQ_URL,
+        {"Authorization": f"Bearer {settings.groq_api_key}"},
+        payload,
+        timeout,
+        backoff,
+    )
+
+    if response.status_code >= 400:
+        # Same rule as above: the body is the provider's message about the
+        # request shape and never carries the prompt.
+        logger.error(
+            "Groq refused the request: %s %s",
+            response.status_code,
+            response.text[:500],
+        )
+        raise GeminiError(f"Groq refused the request ({response.status_code})")
+
+    choices = response.json().get("choices") or []
+    if not choices:
+        raise GeminiError("Groq returned nothing")
+    choice = choices[0]
+    text = ((choice.get("message") or {}).get("content") or "").strip()
+    if choice.get("finish_reason") == "length":
+        logger.error("Groq ran out of output tokens composing a %s", schema.__name__)
+        raise GeminiError(
+            f"Groq's answer was cut off before it finished the {schema.__name__}"
+        )
+    if not text:
+        raise GeminiError(
+            f"Groq returned an empty answer (finish_reason={choice.get('finish_reason')})"
+        )
+    return _validated(text, schema)
+
+
+def _validated(text: str, schema: type[T]) -> T:
+    """The reply as a `schema` instance, or a `GeminiError` naming the field."""
     try:
         return schema.model_validate_json(text)
     except ValidationError as exc:
@@ -405,9 +528,9 @@ async def generate(
             for problem in exc.errors()[:5]
         )
         logger.error(
-            "Gemini returned JSON that did not match %s: %d problem(s) — %s",
+            "The model returned JSON that did not match %s: %d problem(s) — %s",
             schema.__name__,
             len(exc.errors()),
             faults,
         )
-        raise GeminiError(f"Gemini returned a malformed {schema.__name__}") from exc
+        raise GeminiError(f"The model returned a malformed {schema.__name__}") from exc

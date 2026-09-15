@@ -221,7 +221,13 @@ it returns fluent, confident nonsense, which is worse.
 
 **AI: the question library and assembly** (migration `0014`)
 
-One integration, `src/integrations/gemini.py`, spent on two things. It is a
+One integration, `src/integrations/gemini.py`, spent on two things — and
+since the guide, two providers: a model named `groq:<model>` in either
+`GEMINI_MODEL` or `GEMINI_ASSEMBLY_MODEL` goes to Groq's OpenAI-shaped endpoint
+with `GROQ_API_KEY`, through the same `generate()`, the same retry and the same
+errors; nothing in `domain/` can tell. Groq takes JSON Schema as Pydantic
+writes it (no OpenAPI rewriting) and five images per request, so an archive
+with more photographs has the rest placed by the positional rule. It is a
 direct REST call through the shared `httpx.AsyncClient`, **not** the
 `google-genai` SDK — that client is synchronous by default and would block the
 event loop, which is what `test_no_blocking_io_in_src` exists to catch. It takes
@@ -320,6 +326,70 @@ across more material.
   read from the stored plan and never from the request. Chapter order is array
   position, renumbered server-side; a chapter id the plan does not hold is a
   400.
+
+- **Planning is three agents, not one call** (migration `0017`). All in
+  `planner.py`, all through the same `gemini.generate`, none trusted.
+
+    the builder    drafts the plan on `gemini_assembly_model`, as before.
+    the reviewer   reads the draft against the archive on `gemini_model` and
+                   returns `findings` (`attribution`, `structure`,
+                   `contradiction`, `instruction`, `thin`) plus, if it would
+                   change anything, a revised plan. The revision goes through
+                   the same `_clean`/`verify` as the draft and is taken only if
+                   `_accept_revision` says it attributes no worse — a model
+                   asked to remove and re-word can still lose a quote. The
+                   findings are stored on the plan and read out in the chat.
+    the guide      talks to the owner and **never sees a memory's words** —
+                   `_shape` hands it counts, dates and contributors; after
+                   planning it also sees numbered chapter titles, the review
+                   and the builder's `reason`. It runs once, after the
+                   builder, to write the plain-language `guide` note; the
+                   `instructions` the builder gets arrive already restated by
+                   the chat turn that asked for a replan (`POST /plan` takes
+                   no body), so nothing runs before the builder.
+                   `tests/unit/test_planner.py` pins the surface.
+
+  `planner.plan()` returns an `Outcome` — `chapters`, `reason`, `review`,
+  `guide` — and `plan_service.store` keeps the last three inside the plan's
+  jsonb `body`, next to the chapters they describe, because they are replaced
+  with them. Each agent that fails costs only what it adds: no reviewer means
+  the draft stands, no guide means the owner reads `reason`. There is no
+  outline panel: `chat_service.describe()` writes the plan out as numbered
+  chapters plus the note and the findings, and `POST /plan` stores that as a
+  guide message (`announce()`), so a book built from the button and one built
+  in conversation read the same way in the transcript.
+
+  **And the guide takes questions.** `GET`/`POST /memoirs/{id}/chat`,
+  owner-bearer only, 409 once sealed, in `chat_service.py` with
+  `memoir_chat_message` behind it. The guide answers in plain words, and when
+  the owner asks for a different *division* of the memories — what goes
+  together, what is separate — it sets `replan` and `send()` runs
+  `generate_plan` with the request restated, inside the same request (so the
+  frontend allows the plan's timeout) and returns the new plan with the
+  reply. It also renames, reorders and drops chapters itself: it is shown
+  the outline as numbered titles and answers with an `outline` — the
+  chapters to keep, in order, by number — which `chat_service._apply_outline`
+  maps back to ids and puts through `plan_service.edit`, the same path
+  `PATCH /plan` uses. A model is never handed a uuid to copy. After either
+  kind of change `send()` runs `assemble()`, so the book the owner opens is
+  the one they just talked about; the frontend's one "Build" button is
+  `POST /plan` then `POST /assemble` for the same reason, and the outline
+  editor it used to show is gone. The guide's reply is written *before* the
+  builder runs, so it can
+  only promise; `send()` appends the new plan's `guide` note — or its
+  `reason`, when the builder fell back — so a replan that produced the
+  decade outline says why in the chat and not only in the server log. When a
+  request is ambiguous, or the archive cannot honour it as described, the
+  guide asks one question first and replans on the answering turn. Renaming,
+  reordering and dropping chapters it hands back to the outline. A guide that
+  cannot answer is a stored message saying so and a 200, never a 500: the
+  owner's question is kept.
+
+  One replan is three calls on `GEMINI_MODEL` (the chat turn, the reviewer,
+  the guide's note) and one on `GEMINI_ASSEMBLY_MODEL`. A free-tier key allows
+  five flash requests a minute, which two sends in a row exceed: the guide
+  and reviewer then log a 429 and the draft stands with no note. That is a
+  billing ceiling, not a code path.
 
 - **The page itself is editable too** (`chapters/page_service.py`).
   `PATCH /chapters/{id}` — owner bearer only, no link path, 409 once published.
@@ -507,12 +577,16 @@ src/
                                      fallback, _photographs() reads the images
     chapters/page_service.py         edit_chapter(): the assembled page as the
                                      owner corrects it by hand, spans re-found
+    chapters/chat_service.py         the owner's conversation with the guide;
+                                     send() may run generate_plan()
     chapters/plan_service.py         the memoir_plan row: store/load/edit,
                                      rehydrate(), and resurvey() — the rule
                                      that keeps attribution true across an edit
-    chapters/planner.py              the model call: prompt, schema, images,
-                                     and verify()/verify_figures() — quotes and
-                                     asset ids in, offsets and anchors out
+    chapters/planner.py              the three agents — builder, reviewer,
+                                     guide (and chat) — their prompts and
+                                     schemas, and verify()/verify_figures():
+                                     quotes and asset ids in, offsets and
+                                     anchors out
   api/
     dependencies.py                  current_user -> CurrentUser (401s live here)
     health.py                        GET  /health
@@ -532,6 +606,7 @@ src/
                                      GET  /r/{token}    (link + reader session)
                                      GET  /memoirs/{id}/chapters  (auth)
                                      POST/GET/PATCH /memoirs/{id}/plan (auth)
+                                     GET/POST /memoirs/{id}/chat   (auth)
                                      POST /memoirs/{id}/assemble  (auth)
                                      PATCH /chapters/{id}          (auth)
                                      chapters + comments (either credential)
@@ -545,7 +620,7 @@ Environment variables (`.env`): `DATABASE_URL`, `SUPABASE_URL`,
 `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `ENABLE_DEV_ROUTES`,
 `ASSEMBLYAI_API_KEY`, `ASSEMBLYAI_WEBHOOK_SECRET`, `PUBLIC_BASE_URL`,
 `TRANSCRIPTION_ENABLED`, `GEMINI_API_KEY`, `GEMINI_MODEL`,
-`GEMINI_ASSEMBLY_MODEL`, `AI_ENABLED`, `ALLOWED_ORIGINS`, `DB_POOL_MIN_SIZE`,
+`GEMINI_ASSEMBLY_MODEL`, `GROQ_API_KEY`, `AI_ENABLED`, `ALLOWED_ORIGINS`, `DB_POOL_MIN_SIZE`,
 `DB_POOL_MAX_SIZE`, `DB_POOL_TIMEOUT`.
 
 `scripts/seed_demo_memoir.py` fills a memoir with material worth assembling —
@@ -844,9 +919,10 @@ and `README.md` use.
   `docker run --name memoir-pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 -d postgres:17`.
   Without it the `db`-marked tests skip with one sentence rather than erroring, so the unit,
   static and model tiers stay useful.
-- **CI still does not run any of it.** `.github/workflows/ci.yaml` is a placeholder that runs
-  `echo "Add test/lint commands here"`. Everything below passes on a laptop and nothing enforces
-  that it keeps passing.
+- **CI runs the whole suite** on every push and PR to `main`: `.github/workflows/ci.yaml`
+  starts a `postgres:17` service on 5433 and runs `pytest`. `conftest.py` does the rest — it
+  sets every environment variable and applies `migrations/` itself, so the workflow carries no
+  secrets and no `.env`.
 - Auth needs `PyJWT[crypto]` — plain `pip install PyJWT` omits `cryptography` and ES256
   verification fails at runtime, not at import.
 - **Clock skew is not hypothetical.** Supabase issues tokens with an `iat` about a second ahead
@@ -859,11 +935,9 @@ and `README.md` use.
 
 ### Known gaps
 
-- **Nothing runs the tests but a person.** There is now a suite — 238 tests in five tiers, in
-  `tests/` — but `.github/workflows/ci.yaml` still runs `echo "Add test/lint commands here"`, so
-  every guarantee below holds only until somebody pushes without running it. Wiring the workflow
-  to `pip install -r requirements-dev.txt && pytest`, with a Postgres service container on 5433,
-  is the smallest remaining piece of this.
+- ~~**Nothing runs the tests but a person.**~~ Done: `.github/workflows/ci.yaml` runs the suite
+  against a Postgres service container on every push and PR. The frontend has the same, running
+  `npm run verify` (typecheck, lint, vitest).
 
   What the tiers cover, and why they are split:
 

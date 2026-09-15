@@ -193,6 +193,7 @@ def test_a_503_is_retried_on_the_schedule_it_was_given(monkeypatch):
 
     monkeypatch.setattr(settings, "gemini_api_key", "test-key")
     monkeypatch.setattr(settings, "ai_enabled", True)
+    monkeypatch.setattr(settings, "gemini_model", "gemini-2.5-flash")
 
     slept: list[float] = []
     attempts = 0
@@ -252,6 +253,9 @@ def test_generate_refuses_without_a_key(monkeypatch):
 
     monkeypatch.setattr(settings, "gemini_api_key", None)
     monkeypatch.setattr(settings, "ai_enabled", True)
+    # A developer's `.env` may route the default model to Groq; this is about
+    # the Gemini key, so the model is pinned to a Gemini one.
+    monkeypatch.setattr(settings, "gemini_model", "gemini-2.5-flash")
 
     with pytest.raises(gemini.GeminiDisabled):
         asyncio.run(gemini.generate("anything", Leaf))
@@ -314,7 +318,7 @@ def test_a_transient_503_is_retried(monkeypatch):
 
     monkeypatch.setattr(gemini, "client", _fake_client)
 
-    result = asyncio.run(gemini._post("a-model", {}, 60.0))
+    result = asyncio.run(gemini._post("https://example.test/a-model", {}, {}, 60.0))
 
     assert result.status_code == 200
     assert len(attempts) == 2
@@ -341,7 +345,7 @@ def test_a_400_is_not_retried(monkeypatch):
 
     monkeypatch.setattr(gemini, "client", _fake_client)
 
-    assert asyncio.run(gemini._post("a-model", {}, 60.0)).status_code == 400
+    assert asyncio.run(gemini._post("https://example.test/a-model", {}, {}, 60.0)).status_code == 400
     assert len(attempts) == 1
 
 
@@ -367,5 +371,75 @@ def test_retries_are_bounded(monkeypatch):
 
     monkeypatch.setattr(gemini, "client", _fake_client)
 
-    assert asyncio.run(gemini._post("a-model", {}, 60.0)).status_code == 503
+    assert asyncio.run(gemini._post("https://example.test/a-model", {}, {}, 60.0)).status_code == 503
     assert len(attempts) == 3
+
+
+def test_a_groq_model_goes_to_groq_in_openai_shape(monkeypatch):
+    """`groq:` on the model name is the whole switch.
+
+    The same schema, the same errors, the same retry — a different URL, a
+    bearer key, and JSON Schema as Pydantic writes it rather than the OpenAPI
+    subset Gemini needs. Nothing in domain/ has to know which it got.
+    """
+    from src.core.config import settings
+    from src.integrations import gemini
+
+    monkeypatch.setattr(settings, "ai_enabled", True)
+    monkeypatch.setattr(settings, "gemini_api_key", None)
+    monkeypatch.setattr(settings, "groq_api_key", "groq-key")
+
+    seen = {}
+
+    class Answer:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"quote": "a line"}'},
+                    }
+                ]
+            }
+
+    class Client:
+        async def post(self, url, headers, json, timeout):
+            seen.update(url=url, headers=headers, payload=json)
+            return Answer()
+
+    async def fake_client():
+        return Client()
+
+    monkeypatch.setattr(gemini, "client", fake_client)
+
+    result = asyncio.run(
+        gemini.generate(
+            "anything", Leaf, system="rules", model="groq:openai/gpt-oss-120b"
+        )
+    )
+
+    assert result.quote == "a line"
+    assert seen["url"] == gemini._GROQ_URL
+    assert seen["headers"] == {"Authorization": "Bearer groq-key"}
+    assert seen["payload"]["model"] == "openai/gpt-oss-120b"
+    assert [m["role"] for m in seen["payload"]["messages"]] == ["system", "user"]
+    assert seen["payload"]["response_format"]["type"] == "json_schema"
+    assert seen["payload"]["response_format"]["json_schema"]["schema"] == (
+        Leaf.model_json_schema()
+    )
+
+
+def test_a_groq_model_without_a_groq_key_is_switched_off(monkeypatch):
+    """A Gemini key does not let a `groq:` model run, and vice versa."""
+    from src.core.config import settings
+    from src.integrations import gemini
+
+    monkeypatch.setattr(settings, "ai_enabled", True)
+    monkeypatch.setattr(settings, "gemini_api_key", "gemini-key")
+    monkeypatch.setattr(settings, "groq_api_key", None)
+
+    with pytest.raises(gemini.GeminiDisabled):
+        asyncio.run(gemini.generate("anything", Leaf, model="groq:anything"))

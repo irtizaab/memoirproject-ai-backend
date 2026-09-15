@@ -322,9 +322,14 @@ def _plan_by_date(memories: list[dict]) -> list[dict]:
 
 
 async def _plan(
-    memories: list[dict], memoir: dict, photographs: list[dict] | None = None
-) -> tuple[list[dict], str]:
-    """Chapters in reading order, and which assembler produced them.
+    memories: list[dict],
+    memoir: dict,
+    photographs: list[dict] | None = None,
+    instructions: str | None = None,
+) -> tuple[list[dict], str, planner.Outcome]:
+    """Chapters in reading order, which assembler produced them, and the
+    planner's full `Outcome` — its reason for standing aside, its reviewer's
+    findings — for the plan row to keep.
 
     The dispatcher. It asks the planner to read the archive, and falls back to
     `_plan_by_date` whenever it cannot — see `domain/chapters/planner.py`,
@@ -342,10 +347,12 @@ async def _plan(
     the fallback for every memoir and said nothing about it — to the owner or
     to anybody reading the logs.
     """
-    planned = await planner.plan(memories, memoir, _prose, photographs or [])
-    if planned is not None:
-        return planned, "planner"
-    return _plan_by_date(memories), "by_date"
+    outcome = await planner.plan(
+        memories, memoir, _prose, photographs or [], instructions
+    )
+    if outcome.chapters is not None:
+        return outcome.chapters, "planner", outcome
+    return _plan_by_date(memories), "by_date", outcome
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +530,9 @@ async def _write_chapter(cur, memoir_id: str, ordinal: int, planned: dict) -> di
     return written
 
 
-async def generate_plan(memoir_id: str, user_id: str) -> dict | None:
+async def generate_plan(
+    memoir_id: str, user_id: str, instructions: str | None = None
+) -> dict | None:
     """Read the archive, decide what the book is, and store the plan.
 
     Returns the plan as the owner reads it, None if the memoir is not theirs.
@@ -567,7 +576,9 @@ async def generate_plan(memoir_id: str, user_id: str) -> dict | None:
 
         photographs = await _photographs(cur, memoir_id)
 
-    planned, organised_by = await _plan(memories, memoir, photographs)
+    planned, organised_by, outcome = await _plan(
+        memories, memoir, photographs, instructions
+    )
 
     async with db() as conn, conn.cursor() as cur:
         memoir = await owned_memoir(cur, memoir_id, user_id)
@@ -583,7 +594,15 @@ async def generate_plan(memoir_id: str, user_id: str) -> dict | None:
         if not any(chapter["blocks"] for chapter in planned):
             raise NothingToAssemble
 
-        await plan_service.store(cur, memoir_id, planned, organised_by)
+        await plan_service.store(
+            cur,
+            memoir_id,
+            planned,
+            organised_by,
+            reason=outcome.reason,
+            review=outcome.review,
+            guide=outcome.guide,
+        )
         row = await plan_service.load(cur, memoir_id)
 
     logger.info(

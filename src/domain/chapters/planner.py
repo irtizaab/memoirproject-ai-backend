@@ -24,6 +24,7 @@
 # something a reader can audit. It is worth this much care.
 
 import io
+from dataclasses import dataclass
 import logging
 
 from PIL import Image, UnidentifiedImageError
@@ -154,6 +155,68 @@ class Plan(BaseModel):
     chapters: list[PlannedChapter] = Field(default_factory=list)
 
 
+class Finding(BaseModel):
+    """One thing the reviewer noticed about the draft.
+
+    `kind` is a closed set the frontend can group by: `attribution` (a clause
+    with no memory behind it), `structure` (chapters divided or ordered against
+    the archive), `contradiction` (two accounts merged into one), `instruction`
+    (the owner's guidance not followed), `thin` (a memory too short to compose
+    from). Anything else the model invents becomes `structure`.
+    """
+
+    kind: str = Field(default="structure")
+    chapter: str | None = Field(
+        default=None, description="Title of the chapter concerned, or null."
+    )
+    note: str
+    fixed: bool = Field(
+        default=False, description="True only if the revised plan addresses it."
+    )
+
+
+class Review(BaseModel):
+    """What the reviewer found, and the draft as it would correct it."""
+
+    findings: list[Finding] = Field(default_factory=list)
+    revised: Plan | None = Field(
+        default=None, description="The corrected plan, or null to keep the draft."
+    )
+
+
+FINDING_KINDS = ("attribution", "structure", "contradiction", "instruction", "thin")
+MAX_FINDINGS = 12
+
+
+@dataclass
+class Outcome:
+    """What planning produced, all of it.
+
+    `chapters` is None when the deterministic assembler should run, and
+    `reason` then says why in the owner's terms. `review` is the reviewer's
+    findings and whether its revision was taken — present whenever the
+    reviewer ran, whichever way the plan went.
+    """
+
+    chapters: list[dict] | None
+    reason: str | None = None
+    review: dict | None = None
+    guide: str | None = None
+
+
+class GuideNote(BaseModel):
+    """What the guide says to the owner, and what it tells the builder."""
+
+    note: str = Field(default="")
+    instructions_for_builder: str | None = Field(
+        default=None,
+        description=(
+            "The owner's request restated precisely for the builder, or null "
+            "when there was no request."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # The rules the model works under
 # ---------------------------------------------------------------------------
@@ -226,6 +289,77 @@ were not shown does not exist.
 - Leaving a photograph out is allowed. A picture that does not belong anywhere \
 in particular is better left for the archive than pushed against a paragraph \
 it has nothing to do with."""
+
+
+# ---------------------------------------------------------------------------
+# The reviewer
+# ---------------------------------------------------------------------------
+#
+# A second model reads the draft against the same archive and says what is
+# wrong with it. It is not trusted any more than the first: its revision goes
+# through `_clean` like the draft did, and `_accept_revision` refuses one that
+# attributes worse than what it was handed. What it adds is a set of findings
+# the owner can read — the draft used to arrive with no account of itself.
+
+_REVIEW_SYSTEM = """\
+You are reviewing a draft of a family's memoir against the memories it was \
+written from. You are given the memories, each with an id, who left it, and \
+what they said; then the draft plan as JSON. You return findings, and \
+optionally a corrected plan.
+
+What to look for, and the kind to file it under:
+
+- attribution: any clause in a block that is not in the memories. A date, a \
+place, a feeling, a name, an outcome nobody wrote. Also a quote that is not \
+copied character for character from the block's own text, or a memory_id not \
+in the archive.
+- contradiction: two people remembering one event differently, merged into one \
+account, or one of them dropped. Both must stay, each attributed, with \
+diverges set to true.
+- structure: chapters divided or ordered against what the memories say — a \
+life event split across two chapters, unrelated years forced together, undated \
+material not last.
+- instruction: the owner asked for the book to be planned a certain way, and \
+the draft did not follow it where the memories allowed.
+- thin: a memory too short or too empty to compose a paragraph from. Say which \
+one, so the owner can add to it.
+
+Each finding is one or two plain sentences, addressed to the owner of the \
+memoir, who is not a writer or an engineer. Name the chapter it concerns when \
+there is one. Do not quote the memories at length. Do not praise the draft: \
+what is right needs no finding.
+
+The corrected plan:
+
+- Return revised only when you would change something. Null means keep the \
+draft.
+- You may remove a clause, a block or a chapter; re-word a block so that it \
+says only what the memories say; split or merge chapters; reorder; restore a \
+dropped account with diverges true. You may never add anything the memories \
+do not contain, and every block still needs a source for every clause, with \
+quote copied exactly from the block's text.
+- Set fixed to true on a finding only when the revised plan addresses it.
+- Keep every memory_id, asset_id and anchor_memory_id exactly as given."""
+
+
+# ---------------------------------------------------------------------------
+# The guide
+# ---------------------------------------------------------------------------
+#
+# The one agent that talks to the owner. It never sees a memory's words — only
+# counts, titles, the reviewer's findings and the builder's reason — so it
+# has nothing to fabricate from, and nothing a family wrote reaches a third
+# model call. It runs twice: before the builder, to turn the owner's request
+# into precise instructions; after, to say in plain words what happened and
+# what would make the next plan better.
+
+_GUIDE_SYSTEM = """You are the guide for a family assembling a memoir of someone they have lost. You speak to the owner of the memoir, plainly, in two to four sentences. They are not a writer or an engineer, and they may be grieving.
+
+You are told facts about the archive and about how planning went: how many memories there are, how many are dated, what the reviewer found, why the planner could not run. You say only what follows from those facts. You never invent a memory, a person, a date or an event, and you never describe what the memoir says — you have not read it.
+
+Never give a score, a percentage, a count of what is "missing", or any encouragement to keep going. Say what would help — a date on an undated memory, a second account of an event, more words on a memory that is only a title — and stop.
+
+When the owner has asked for the book to be planned a certain way, restate that request for the planner in instructions_for_builder: precise, short, and adding nothing the owner did not ask for. Leave it null when there was no request. Never address the reader of the memoir, and never write about the family's grief."""
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +516,7 @@ def verify_figures(
 
 def _clean(
     plan: Plan, memories: list[dict], photographs: list[dict] | None = None
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """The plan, reduced to what is safe to write. Chapters in reading order.
 
     Returns the same shape `assembly_service._plan_by_date` returns, so the
@@ -480,7 +614,12 @@ def _clean(
         unattributed,
     )
 
-    return chapters
+    return chapters, {
+        "chapters": len(plan.chapters),
+        "blocks": arrived,
+        "blank": blank,
+        "unattributed": unattributed,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -633,8 +772,96 @@ async def plan(
     memoir: dict,
     prose,
     photographs: list[dict] | None = None,
-) -> list[dict] | None:
-    """Read the archive and return chapters, or None if the model could not.
+    instructions: str | None = None,
+) -> Outcome:
+    """Build, review, guide. Returns an `Outcome`.
+
+    `instructions` arrive already restated: the only caller that sends any is
+    `chat_service`, and the guide's chat turn is what restated them. A second
+    restating call here was one flash request per replan spent saying the
+    same thing again. The guide runs once, last, to tell the owner what
+    happened; if it cannot, the owner reads `reason` instead, as before.
+    """
+    shape = _shape(memories, memoir)
+    outcome = await _draft_and_review(
+        memories, memoir, prose, photographs, instructions
+    )
+    outcome.guide = await _guide_after(shape, outcome)
+    return outcome
+
+
+def _shape(memories: list[dict], memoir: dict) -> dict:
+    """The archive as counts. What the guide is allowed to know about it."""
+    dated = [m["happened_on"] for m in memories if m.get("happened_on")]
+    return {
+        "subject": memoir["subject_name"],
+        "memories": len(memories),
+        "dated": len(dated),
+        "earliest": str(min(dated)) if dated else None,
+        "latest": str(max(dated)) if dated else None,
+        "contributors": len({m["participant_id"] for m in memories}),
+    }
+
+
+async def _guide_after(shape: dict, outcome: Outcome) -> str | None:
+    """A plain sentence or three about how planning went. None if it could not."""
+    context = {
+        "archive": shape,
+        "organised_by": "planner" if outcome.chapters is not None else "by_date",
+        "reason": outcome.reason,
+        "chapters": [c["title"] for c in outcome.chapters or []],
+        "review": outcome.review,
+    }
+    prompt = (
+        f"How planning went: {context}\n\n"
+        "Write the note to the owner. Leave instructions_for_builder null."
+    )
+    reply = await _guide(prompt)
+    if reply is None:
+        return None
+    return reply.note.strip()[:1000] or None
+
+
+async def _guide(prompt: str) -> GuideNote | None:
+    try:
+        return await gemini.generate(
+            prompt,
+            GuideNote,
+            system=_GUIDE_SYSTEM,
+            model=settings.gemini_model,
+            timeout=60.0,
+        )
+    except gemini.GeminiError as exc:
+        logger.info("Guide did not run: %s", exc)
+        return None
+
+
+async def _draft_and_review(
+    memories: list[dict],
+    memoir: dict,
+    prose,
+    photographs: list[dict] | None,
+    instructions: str | None,
+) -> Outcome:
+    """Read the archive, draft the book, review the draft. Returns an `Outcome`.
+
+    `Outcome.chapters` is None when the deterministic assembler should run, and
+    `Outcome.reason` is then the sentence the owner reads. It used to live only
+    in the log, which the owner cannot see, so "the archive could not be read
+    this time" was all they got.
+
+    Two model calls. The builder drafts on the assembly model; the reviewer
+    reads that draft against the archive on the cheaper one and returns
+    findings plus, if it would change anything, a revision. The revision is
+    checked exactly as the draft was and taken only if it attributes at least
+    as well — see `_accept_revision`. A reviewer that fails costs nothing but
+    its findings: the draft stands.
+
+    `instructions` are the owner's request about how the book should be
+    divided — "keep the war years together", "one chapter per house" — as
+    the guide restated it from the conversation. They shape the plan; they
+    cannot add to it, because the attribution rules still hold over every
+    paragraph.
 
     None means "use the deterministic assembler" and covers every failure:
     switched off, no key, unreachable, refused, malformed, or a plan that
@@ -650,6 +877,12 @@ async def plan(
     # exactly what was successfully fetched.
     images, shown = await _load_images(photographs or [])
     described = _describe(memories, memoir, prose, shown)
+    if instructions and instructions.strip():
+        described += (
+            "\n\n---\nThe owner asks that the book be planned this way. Follow "
+            "it where the memories allow, and never invent anything to satisfy "
+            f"it:\n{instructions.strip()[:2000]}"
+        )
 
     try:
         result = await gemini.generate(
@@ -686,14 +919,219 @@ async def plan(
         # GEMINI_API_KEY plans every memoir by decade and is otherwise silent
         # about it, and that went unnoticed once.
         logger.warning("Assembly is planning by date: %s", exc)
-        return None
+        return Outcome(None, "The model is switched off in this deployment.")
     except gemini.GeminiError as exc:
         logger.warning("Assembly is planning by date: %s", exc)
-        return None
+        return Outcome(None, f"The model could not be reached: {exc}")
 
-    chapters = _clean(result, memories, shown)
+    chapters, tally = _clean(result, memories, shown)
     if not chapters:
         logger.warning("Assembly is planning by date: nothing survived verification")
+        return Outcome(None, _nothing_survived(memories, tally))
+
+    review = await _review(result, described)
+    if review is None:
+        return Outcome(chapters)
+
+    revised = False
+    if review.revised is not None:
+        candidate, candidate_tally = _clean(review.revised, memories, shown)
+        if _accept_revision(tally, candidate, candidate_tally):
+            chapters, revised = candidate, True
+        else:
+            logger.info("Reviewer's revision refused; keeping the draft")
+
+    return Outcome(chapters, review=_findings(review, revised))
+
+
+async def _review(draft: Plan, described: str) -> Review | None:
+    """The reviewer's reading of the draft, or None if it could not read.
+
+    Text only — no images. Whether a photograph sits beside the right
+    paragraph is already checked deterministically by `verify_figures`, and
+    what the reviewer is for is the prose: what it claims, and who said it.
+    """
+    prompt = (
+        f"{described}\n\n---\nThe draft plan, as JSON:\n"
+        f"{draft.model_dump_json(exclude_none=True)}"
+    )
+    try:
+        return await gemini.generate(
+            prompt,
+            Review,
+            system=_REVIEW_SYSTEM,
+            model=settings.gemini_model,
+            temperature=0.2,
+            timeout=300.0,
+            backoff=gemini.PATIENT_BACKOFF,
+            # A revision is a whole plan, so it needs the same room.
+            max_output_tokens=MAX_PLAN_TOKENS,
+        )
+    except gemini.GeminiError as exc:
+        logger.warning("Reviewer did not run: %s", exc)
         return None
 
-    return chapters
+
+def _accept_revision(
+    draft_tally: dict, candidate: list[dict], candidate_tally: dict
+) -> bool:
+    """Whether the reviewer's plan replaces the draft.
+
+    The reviewer is asked to remove and re-word, never to add — but it is a
+    model, and a re-worded paragraph can lose the quote that attributed it.
+    So the rule is the one thing this file can measure: a revision is taken
+    only if it left at least one chapter standing and dropped no more blocks
+    for want of attribution than the draft did.
+    """
+    return bool(candidate) and (
+        candidate_tally["unattributed"] <= draft_tally["unattributed"]
+    )
+
+
+def _findings(review: Review, revised: bool) -> dict:
+    """The review as stored on the plan: shape checked, content trimmed."""
+    findings = []
+    for finding in review.findings[:MAX_FINDINGS]:
+        note = finding.note.strip()
+        if not note:
+            continue
+        findings.append(
+            {
+                "kind": finding.kind if finding.kind in FINDING_KINDS else "structure",
+                "chapter": (finding.chapter or "").strip()[:200] or None,
+                "note": note[:600],
+                # A finding cannot have been fixed by a revision that was
+                # not taken.
+                "fixed": bool(finding.fixed) and revised,
+            }
+        )
+    logger.info("Reviewer: %d findings, revision %s", len(findings), "taken" if revised else "not taken")
+    return {"findings": findings, "revised": revised}
+
+
+def _nothing_survived(memories: list[dict], tally: dict) -> str:
+    """Why a plan that came back was thrown away, in the owner's terms."""
+    read = len(memories)
+    if tally["blocks"] == 0:
+        return (
+            f"The model read {read} memor{'y' if read == 1 else 'ies'} and "
+            "found nothing it could write a paragraph from. Short or "
+            "placeholder memories give it nothing to compose with."
+        )
+    return (
+        f"The model wrote {tally['blocks']} paragraphs, but "
+        f"{tally['unattributed']} could not be traced back to a memory word "
+        f"for word and {tally['blank']} were empty, so none were kept."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The guide, in conversation
+# ---------------------------------------------------------------------------
+
+
+class OutlineChapter(BaseModel):
+    """One chapter as the guide would have it: which one, and its title."""
+
+    number: int = Field(description="the chapter's current number in the outline")
+    title: str
+
+
+class ChatTurn(BaseModel):
+    """One reply from the guide, and what it wants done to the book."""
+
+    reply: str
+    replan: bool = Field(
+        default=False,
+        description=(
+            "true only when the owner asked for something that changes which "
+            "chapter a memory belongs in, and the planner must run again"
+        ),
+    )
+    instructions_for_builder: str | None = Field(
+        default=None,
+        description="Set when replan is true: the owner's request, restated.",
+    )
+    outline: list[OutlineChapter] | None = Field(
+        default=None,
+        description=(
+            "Set only to rename, reorder or leave out chapters: every chapter "
+            "to keep, in reading order, by its current number, with the title "
+            "it should have. Null when the outline is not being changed."
+        ),
+    )
+
+
+_CHAT_ADDENDUM = """
+
+You are now in conversation with the owner. You are given the shape of the \
+archive, the outline as it stands — numbered chapters with their titles, the \
+reviewer's findings, the guide's last note — and the conversation so far, \
+ending with the owner's latest message. Reply to that message.
+
+You can change the book two ways, and you should do so when asked, as well \
+as suggest it when the outline or the findings show something worth fixing:
+
+  outline   to rename, reorder or leave out chapters. List every chapter to \
+            keep, in the order wanted, by its current number, with its title. \
+            A chapter left off the list is dropped. Numbers are the ones in \
+            the outline you were shown — never invent one.
+  replan    with instructions_for_builder, when the change is to how the \
+            memories are divided: what goes together, what is separate, what \
+            the book is organised around. This takes minutes and replaces \
+            the outline; say so in one clause.
+
+Either way the book is rebuilt from the result straight away. When you have \
+made a change, say plainly what you did. When the owner's message is not a \
+request — a question, or a worry — answer it, and where the findings or the \
+archive's shape suggest one, recommend one concrete change and ask whether \
+they want it. If a request could be read two ways, or the archive as \
+described cannot honour it — a chronological order when some memories have \
+no date, for instance — ask one short question first and change nothing. \
+When the owner's latest message answers a question you asked, act on it in \
+that turn. Never set both outline and replan: a replan produces new chapters \
+and the numbers no longer mean anything. You have not planned anything when \
+you reply: never describe what a new outline holds. That is told to the \
+owner afterwards, by the note written when planning finishes."""
+
+
+async def chat(
+    shape: dict, plan: dict | None, history: list[dict], message: str
+) -> ChatTurn | None:
+    """The guide's reply to the owner's latest message. None if it could not.
+
+    `plan` is the stored plan's summary, reduced here to what the guide may
+    see: numbered titles, the review, the note. Never a block. The numbers
+    are what an `outline` answer refers to, and `chat_service` maps them
+    back to chapter ids — a model is not handed uuids to copy. `history`
+    is the prior messages as `{role, body}`, oldest first.
+    """
+    outline = None
+    if plan is not None:
+        outline = {
+            "organised_by": plan["organised_by"],
+            "chapters": [
+                {"number": number, "title": c["title"]}
+                for number, c in enumerate(plan["chapters"], start=1)
+            ],
+            "review": plan.get("review"),
+            "guide": plan.get("guide"),
+        }
+    transcript = "\n".join(
+        f"{turn['role']}: {turn['body'][:2000]}" for turn in history[-20:]
+    )
+    prompt = (
+        f"The archive: {shape}\n\nThe outline: {outline}\n\n"
+        f"The conversation so far:\n{transcript}\n\nowner: {message.strip()[:4000]}"
+    )
+    try:
+        return await gemini.generate(
+            prompt,
+            ChatTurn,
+            system=_GUIDE_SYSTEM + _CHAT_ADDENDUM,
+            model=settings.gemini_model,
+            timeout=60.0,
+        )
+    except gemini.GeminiError as exc:
+        logger.info("Guide did not answer: %s", exc)
+        return None

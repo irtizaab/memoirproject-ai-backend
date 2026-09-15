@@ -36,6 +36,7 @@ from src.domain.chapters.plan_service import (
 )
 from src.domain.chapters.plan_service import edit as edit_plan
 from src.domain.chapters.plan_service import read as read_plan
+from src.domain.chapters import chat_service
 from src.domain.chapters.chapter_service import (
     SpanOutOfRange,
     add_comment,
@@ -62,6 +63,9 @@ from src.models.chapter_models import (
     AssemblyResult,
     Chapter,
     ChapterEdit,
+    ChatMessage,
+    ChatReply,
+    ChatSend,
     MemoirPlan,
     PlanUpdate,
     CommentCreate,
@@ -248,6 +252,9 @@ async def post_plan(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
     if plan is None:
         raise HTTPException(status_code=404, detail="memoir not found")
 
+    # And the guide says what was built, so the outline lives in the
+    # conversation that changes it rather than in a panel beside it.
+    await chat_service.announce(str(memoir_id), user.id, plan)
     return plan
 
 
@@ -334,6 +341,49 @@ async def patch_plan(
 # ---------------------------------------------------------------------------
 # Making the book in the first place
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Talking to the guide
+# ---------------------------------------------------------------------------
+#
+# Owner-only, bearer-only, like the plan. The guide answers in plain words and
+# may plan the memoir again on the owner's behalf — which is why POST can take
+# as long as POST /plan, and why it answers 409 once the memoir is sealed.
+
+
+@router.get("/memoirs/{memoir_id}/chat", response_model=list[ChatMessage])
+async def get_chat(memoir_id: UUID, user: CurrentUser = Depends(current_user)):
+    """The conversation so far, oldest first. Owner only."""
+    messages = await chat_service.list_messages(str(memoir_id), user.id)
+    if messages is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+    return messages
+
+
+@router.post("/memoirs/{memoir_id}/chat", response_model=ChatReply)
+async def post_chat(
+    memoir_id: UUID,
+    message: ChatSend,
+    user: CurrentUser = Depends(current_user),
+):
+    """Say something to the guide. Owner only.
+
+    Slow when the guide decides to plan again: it runs the builder in this
+    request, so the frontend allows the plan's timeout. A guide that cannot
+    answer is still a 200 with a message saying so — nothing is broken, an
+    upstream service was away, and the owner's question is kept.
+    """
+    try:
+        result = await chat_service.send(str(memoir_id), user.id, message.body)
+    except MemoirSealed:
+        raise HTTPException(
+            status_code=409,
+            detail="a published memoir cannot be replanned",
+        )
+    if result is None:
+        raise HTTPException(status_code=404, detail="memoir not found")
+    return result
 
 
 @router.post("/memoirs/{memoir_id}/assemble", response_model=AssemblyResult)

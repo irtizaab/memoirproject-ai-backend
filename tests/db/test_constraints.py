@@ -475,3 +475,43 @@ def test_rls_is_on_everywhere_with_no_policies(db_conn):
         assert cur.fetchone()["n"] == 0, (
             "a policy now exists — the security model has changed"
         )
+
+
+# ---------------------------------------------------------------------------
+# The conversation with the guide (0017)
+# ---------------------------------------------------------------------------
+
+
+def test_a_chat_message_has_a_speaker_and_some_words(db_conn, owner):
+    """Two roles, a body between one and four thousand characters, and only
+    the guide can have replanned. The API checks all three first; these are
+    the guarantee underneath it."""
+    memoir_id = owner["memoir"]["id"]
+
+    assert (
+        violates(
+            db_conn,
+            "INSERT INTO memoir_chat_message (memoir_id, role, body) "
+            "VALUES (%(id)s, 'reader', 'hello')",
+            {"id": memoir_id},
+        )
+        == "memoir_chat_message_role"
+    )
+    assert (
+        violates(
+            db_conn,
+            "INSERT INTO memoir_chat_message (memoir_id, role, body) "
+            "VALUES (%(id)s, 'owner', '')",
+            {"id": memoir_id},
+        )
+        == "memoir_chat_message_body_length"
+    )
+    assert (
+        violates(
+            db_conn,
+            "INSERT INTO memoir_chat_message (memoir_id, role, body, replanned) "
+            "VALUES (%(id)s, 'owner', 'hello', true)",
+            {"id": memoir_id},
+        )
+        == "memoir_chat_message_owner_never_replans"
+    )

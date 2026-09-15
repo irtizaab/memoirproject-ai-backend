@@ -117,6 +117,7 @@ pytest_plugins = ["tests.factories"]
 # and 0005, and the billing tests read them — truncating them would leave a
 # database that no longer matches the one the migrations describe.
 MUTABLE_TABLES = [
+    "memoir_chat_message",
     "comment",
     "comment_thread",
     "block_source",

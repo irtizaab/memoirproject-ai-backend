@@ -370,6 +370,22 @@ class PlannedChapter(BaseModel):
     memory_ids: list[UUID] = Field(default_factory=list)
 
 
+class PlanFinding(BaseModel):
+    """One thing the reviewer noticed. See `planner.Finding`."""
+
+    kind: Literal["attribution", "structure", "contradiction", "instruction", "thin"]
+    chapter: str | None = None
+    note: str
+    fixed: bool = False
+
+
+class PlanReview(BaseModel):
+    """The reviewer's account of the draft, and whether its revision was taken."""
+
+    findings: list[PlanFinding] = Field(default_factory=list)
+    revised: bool = False
+
+
 class MemoirPlan(BaseModel):
     """The plan as the owner reads it, before the book is written.
 
@@ -383,10 +399,43 @@ class MemoirPlan(BaseModel):
     """
 
     organised_by: PlanOrigin
+    # Set only when `organised_by` is "by_date": the sentence explaining why.
+    reason: str | None = None
+    # Present whenever the reviewer ran, whichever way the plan went.
+    review: PlanReview | None = None
+    # The guide's note to the owner: how planning went, in plain words.
+    guide: str | None = None
     generated_at: datetime
     edited_at: datetime | None = None
     assembled_at: datetime | None = None
     chapters: list[PlannedChapter] = Field(default_factory=list)
+
+
+class ChatMessage(BaseModel):
+    """One message in the owner's conversation with the guide.
+
+    Owner-only, like `MemoirPlan`: reachable by bearer token and no link, so
+    there is no forwarded-link question to answer about any field.
+    """
+
+    id: UUID
+    role: Literal["owner", "guide"]
+    body: str
+    replanned: bool = False
+    created_at: datetime
+
+
+class ChatSend(BaseModel):
+    """Body of POST /memoirs/{id}/chat. The bounds mirror the CHECK in 0017."""
+
+    body: str = Field(min_length=1, max_length=4000)
+
+
+class ChatReply(BaseModel):
+    """The guide's answer, and the new plan if it planned again."""
+
+    reply: ChatMessage
+    plan: "MemoirPlan | None" = None
 
 
 class PlanUpdate(BaseModel):

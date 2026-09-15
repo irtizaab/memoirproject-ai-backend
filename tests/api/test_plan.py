@@ -21,7 +21,7 @@ import uuid
 
 import pytest
 
-from src.domain.chapters import assembly_service
+from src.domain.chapters import assembly_service, planner
 from tests.conftest import requires_db
 
 pytestmark = [requires_db, pytest.mark.db]
@@ -85,11 +85,19 @@ def planner_says(monkeypatch):
     tests need and what the prose tests should not have to think about.
     """
 
-    def install(*titles, place_photographs=False):
-        async def _fake(memories, memoir, prose, photographs=None):
+    def install(
+        *titles, place_photographs=False, review=None, guide=None, reason=None
+    ):
+        async def _fake(
+            memories, memoir, prose, photographs=None, instructions=None
+        ):
+            if reason is not None:
+                # The builder could not: `chapters=None` sends the caller
+                # to the decade fallback, and `reason` is what the owner reads.
+                return planner.Outcome(None, reason=reason, guide=guide)
             usable = [m for m in memories if prose(m)]
             photographs = list(photographs or [])
-            return [
+            return planner.Outcome(review=review, guide=guide, chapters=[
                 {
                     "title": title,
                     "from_year": 1982,
@@ -130,7 +138,7 @@ def planner_says(monkeypatch):
                     "memories": list(usable),
                 }
                 for title in titles
-            ]
+            ])
 
         monkeypatch.setattr(assembly_service.planner, "plan", _fake)
 
@@ -164,6 +172,48 @@ def test_the_model_organises_the_book_and_says_so(as_owner, archive, planner_say
     ]
     assert plan["assembled_at"] is None
     assert plan["edited_at"] is None
+
+
+def test_reviewer_findings_come_back_on_the_plan(as_owner, archive, planner_says):
+    """What the reviewer found is stored with the plan and read back with it.
+
+    The draft used to arrive with no account of itself. Now the findings
+    travel inside the plan row, so the owner reads them under the outline and
+    a regenerated plan replaces them along with the chapters.
+    """
+    planner_says(
+        "The house",
+        review={
+            "findings": [
+                {
+                    "kind": "thin",
+                    "chapter": None,
+                    "note": "One memory is a single word and gave nothing to write from.",
+                    "fixed": False,
+                }
+            ],
+            "revised": False,
+        },
+    )
+    owner = as_owner(archive["owner_id"])
+
+    planned = owner.post(f"/memoirs/{archive['memoir_id']}/plan").json()
+    fetched = owner.get(f"/memoirs/{archive['memoir_id']}/plan").json()
+
+    assert planned["review"]["revised"] is False
+    assert planned["review"]["findings"][0]["kind"] == "thin"
+    assert fetched["review"] == planned["review"]
+
+
+def test_the_guide_note_travels_with_the_plan(as_owner, archive, planner_says):
+    planner_says("The house", guide="One memory is only a title; a few more words would help.")
+    owner = as_owner(archive["owner_id"])
+
+    planned = owner.post(f"/memoirs/{archive['memoir_id']}/plan").json()
+    fetched = owner.get(f"/memoirs/{archive['memoir_id']}/plan").json()
+
+    assert planned["guide"].startswith("One memory")
+    assert fetched["guide"] == planned["guide"]
 
 
 def test_a_plan_can_be_read_back_without_planning_again(

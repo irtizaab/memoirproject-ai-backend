@@ -297,7 +297,15 @@ def rehydrate(
 # ---------------------------------------------------------------------------
 
 
-async def store(cur, memoir_id: str, chapters: list[dict], organised_by: str) -> None:
+async def store(
+    cur,
+    memoir_id: str,
+    chapters: list[dict],
+    organised_by: str,
+    reason: str | None = None,
+    review: dict | None = None,
+    guide: str | None = None,
+) -> None:
     """Write the plan, replacing whatever was there.
 
     Generating again is how the owner asks for a different book, so this is an
@@ -321,7 +329,17 @@ async def store(cur, memoir_id: str, chapters: list[dict], organised_by: str) ->
         """,
         {
             "memoir_id": memoir_id,
-            "body": Jsonb(_document(chapters)),
+            # Why it fell back to decades, and what the reviewer found — kept
+            # inside the document rather than in columns: they are only ever
+            # read alongside the plan, and they are replaced with it.
+            "body": Jsonb(
+                {
+                    **_document(chapters),
+                    "reason": reason,
+                    "review": review,
+                    "guide": guide,
+                }
+            ),
             "organised_by": organised_by,
         },
     )
@@ -343,6 +361,14 @@ async def load(cur, memoir_id: str) -> dict | None:
         {"memoir_id": memoir_id},
     )
     return await cur.fetchone()
+
+
+def _extras(row: dict) -> dict:
+    """Everything in a plan's body but the chapters."""
+    body = row["body"]
+    if isinstance(body, str):
+        body = json.loads(body)
+    return {k: v for k, v in body.items() if k != "chapters"}
 
 
 def summarise(row: dict) -> dict:
@@ -373,6 +399,9 @@ def summarise(row: dict) -> dict:
 
     return {
         "organised_by": row["organised_by"],
+        "reason": body.get("reason"),
+        "review": body.get("review"),
+        "guide": body.get("guide"),
         "generated_at": row["generated_at"],
         "edited_at": row["edited_at"],
         "assembled_at": row["assembled_at"],
@@ -618,7 +647,9 @@ async def edit(memoir_id: str, user_id: str, chapters: list[dict]) -> dict | Non
             """,
             {
                 "memoir_id": memoir_id,
-                "body": Jsonb({"chapters": edited}),
+                # The rest of the body — reason, review, guide — describes
+                # this plan and stays with it through an edit.
+                "body": Jsonb({**_extras(row), "chapters": edited}),
             },
         )
 
